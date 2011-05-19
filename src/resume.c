@@ -30,7 +30,7 @@ handle_resume(u8 status)
 {
     init_dma();
 
-    debug_serial_setup();
+    debug_setup();
     dprintf(1, "In resume (status=%d)\n", status);
 
     switch (status) {

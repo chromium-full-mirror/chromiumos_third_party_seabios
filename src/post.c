@@ -373,7 +373,7 @@ _start(void)
 {
     init_dma();
 
-    debug_serial_setup();
+    debug_setup();
     dprintf(1, "Start bios (version %s)\n", VERSION);
 
     if (HaveRunPost)

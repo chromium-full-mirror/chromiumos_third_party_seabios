@@ -231,7 +231,7 @@ int wait_preempt(void);
 void check_preempt(void);
 
 // output.c
-void debug_serial_setup(void);
+void debug_setup(void);
 void panic(const char *fmt, ...)
     __attribute__ ((format (printf, 1, 2))) __noreturn;
 void printf(const char *fmt, ...)
