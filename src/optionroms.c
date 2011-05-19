@@ -232,6 +232,24 @@ getRomPriority(u64 *sources, struct rom_header *rom, int instance)
     return bootprio_find_named_rom(romfile_name(source), instance);
 }
 
+/* some vga option roms are used for several chipsets but they only have one
+ * PCI ID in their header. If we encounter such an option rom, we need to do
+ * the mapping ourselfes
+ */
+
+u32 map_oprom_vendev(u32 vendev)
+{
+    u32 new_vendev=vendev;
+
+    switch(vendev) {
+    case 0x80118086:
+        new_vendev=0x80018086;
+        break;
+    }
+
+    return new_vendev;
+}
+
 /****************************************************************
  * Roms in CBFS
  ****************************************************************/
@@ -330,9 +348,10 @@ map_pcirom(u16 bdf, u32 vendev)
         }
 
         u32 vd = pci_vd(pci->vendor, pci->device);
-        if (vd == vendev && pci->type == PCIROM_CODETYPE_X86)
-            // A match
-            break;
+	if (pci->type == PCIROM_CODETYPE_X86)
+            if (vd == vendev || vd == map_oprom_vendev(vendev))
+                break; // A match
+
         dprintf(6, "Didn't match dev/ven (got %08x) or type (got %d)\n"
                 , vd, pci->type);
         if (pci->indicator & 0x80) {
