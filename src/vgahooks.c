@@ -14,6 +14,7 @@
 
 #define VH_VIA 1
 #define VH_INTEL 2
+#define VH_GOOGLE 3
 
 int VGAHookHandlerType VAR16VISIBLE;
 
@@ -228,6 +229,26 @@ getac_setup(struct pci_device *pci)
 {
 }
 
+static void
+google_155f(struct bregs *regs)
+{
+    dprintf(1, "Executing Google specific interrupt %02x.\n", regs->al);
+    switch (regs->al) {
+    case 0x21:
+    case 0x22:
+        regs->ax = 0x005f;
+        set_success(regs);
+        break;
+    default:   handle_155fXX(regs); break;
+    }
+}
+
+static void
+google_setup(struct pci_device *pci)
+{
+    VGAHookHandlerType = VH_GOOGLE;
+}
+
 
 /****************************************************************
  * Entry and setup
@@ -246,6 +267,7 @@ handle_155f(struct bregs *regs)
     switch (htype) {
     case VH_VIA:   via_155f(regs); break;
     case VH_INTEL: intel_155f(regs); break;
+    case VH_GOOGLE: google_155f(regs); break;
     default:       handle_155fXX(regs); break;
     }
 }
@@ -263,6 +285,10 @@ vgahook_setup(struct pci_device *pci)
         getac_setup(pci);
     else if (strcmp(CBvendor, "RODA") == 0 && strcmp(CBpart, "RK886EX") == 0)
         roda_setup(pci);
+    else if (strcmp(CBvendor, "Google") == 0 && strcmp(CBpart, "CR-48") == 0)
+        google_setup(pci);
+    else if (strcmp(CBvendor, "Samsung") == 0 && strcmp(CBpart, "Alex") == 0)
+        google_setup(pci);
     else if (pci->vendor == PCI_VENDOR_ID_VIA)
         via_setup(pci);
 }
