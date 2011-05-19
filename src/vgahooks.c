@@ -21,6 +21,8 @@ int CBmainboard VAR16VISIBLE;
 #define KONTRON_986LCD_M	1
 #define GETAC_P470		2
 #define RODA_RK886EX		3
+#define GOOGLE_CR48		4
+#define SAMSUNG_ALEX		5
 
 struct mainboards {
 	char *vendor;
@@ -32,6 +34,8 @@ struct mainboards mainboard_list[] = {
 	{ "KONTRON",	"986LCD-M",	KONTRON_986LCD_M },
 	{ "GETAC",	"P470",		GETAC_P470 },
 	{ "RODA",	"RK886EX",	RODA_RK886EX },
+	{ "Google",	"CR-48",	GOOGLE_CR48 },
+	{ "Samsung",	"Alex",	 	SAMSUNG_ALEX },
 };
 
 static void
@@ -255,6 +259,21 @@ getac_155f(struct bregs *regs)
     }
 }
 
+static void
+google_155f(struct bregs *regs)
+{
+    dprintf(1, "Executing Google specific interrupt %02x.\n", regs->al);
+    switch (regs->al) {
+    case 0x21:
+    case 0x22:
+	    regs->ax = 0x005f;
+	    set_success(regs);
+	    break;
+    default:   handle_155fXX(regs); break;
+    }
+}
+
+
 /****************************************************************
  * Entry and setup
  ****************************************************************/
@@ -279,6 +298,10 @@ handle_155f(struct bregs *regs)
 	return;
     case GETAC_P470:
         getac_155f(regs);
+	return;
+    case GOOGLE_CR48:
+    case SAMSUNG_ALEX:
+	google_155f(regs);
 	return;
     case MAINBOARD_DEFAULT:
         bdf = GET_GLOBAL(VGAbdf);
@@ -308,7 +331,6 @@ vgahook_setup(const char *vendor, const char *part)
     for (i=0; i<(sizeof(mainboard_list) / sizeof(mainboard_list[0])); i++) {
         if (!strcmp(vendor, mainboard_list[i].vendor) &&
             !strcmp(part, mainboard_list[i].device)) {
-            printf("Found mainboard %s %s\n", vendor, part);
             CBmainboard = mainboard_list[i].type;
             break;
         }
