@@ -183,6 +183,23 @@ getRomPriority(u64 *sources, struct rom_header *rom, int instance)
     return bootprio_find_named_rom(romfile_name(source), instance);
 }
 
+/* some vga option roms are used for several chipsets but they only have one
+ * PCI ID in their header. If we encounter such an option rom, we need to do
+ * the mapping ourselfes
+ */
+
+u32 map_oprom_vendev(u32 vendev)
+{
+    u32 new_vendev=vendev;
+
+    switch(vendev) {
+    case 0xa0118086:
+        new_vendev=0xa0018086;
+        break;
+    }
+
+    return new_vendev;
+}
 
 /****************************************************************
  * Roms in CBFS
@@ -292,8 +309,9 @@ map_pcirom(struct pci_device *pci)
             goto fail;
         }
 
-        if (pd->vendor == pci->vendor && pd->device == pci->device
-            && pd->type == PCIROM_CODETYPE_X86)
+        if (pd->type == PCIROM_CODETYPE_X86 &&
+            ((pd->vendor == pci->vendor && pd->device == pci->device) ||
+             pd->vendor == map_oprom_vendev(pci->vendor)))
             // A match
             break;
         dprintf(6, "Didn't match dev/ven (got %04x:%04x) or type (got %d)\n"
