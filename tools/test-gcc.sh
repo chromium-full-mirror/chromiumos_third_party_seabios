@@ -8,11 +8,16 @@ TMPFILE2=out/tmp_testcompile2.c
 TMPFILE2o=out/tmp_testcompile2.o
 TMPFILE3o=out/tmp_testcompile3.o
 
+report_error() {
+  this_prog=$(basename $0)
+  (1>&2 echo "********* $this_prog: $* *******" )
+}
+
 # Test for "-fwhole-program".  Older versions of gcc (pre v4.1) don't
 # support the whole-program optimization - detect that.
 $CC -fwhole-program -S -o /dev/null -xc /dev/null > /dev/null 2>&1
 if [ $? -ne 0 ]; then
-    echo "  Working around no -fwhole-program" > /dev/fd/2
+    report_error "  Working around no -fwhole-program"
     echo 2
     exit 0
 fi
@@ -36,7 +41,7 @@ EOF
 $CC -Os -c -fwhole-program $TMPFILE2 -o $TMPFILE2o > /dev/null 2>&1
 $CC -nostdlib -Os $TMPFILE1o $TMPFILE2o -o $TMPFILE3o > /dev/null 2>&1
 if [ $? -ne 0 ]; then
-    echo "  Working around non-functional -fwhole-program" > /dev/fd/2
+    report_error "  Working around non-functional -fwhole-program"
     echo 2
     exit 0
 fi
@@ -71,7 +76,7 @@ $CC -O -g -fwhole-program -combine -c $TMPFILE1 $TMPFILE2 -o $TMPFILE1o > /dev/n
 if [ $? -eq 0 ]; then
     echo 0
 else
-    echo "  Working around non-functional -combine" > /dev/fd/2
+    report_error "  Working around non-functional -combine"
     echo 1
 fi
 
