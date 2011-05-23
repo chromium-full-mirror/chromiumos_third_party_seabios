@@ -9,6 +9,11 @@ TMPFILE2=out/tmp_testcompile2.c
 TMPFILE2o=out/tmp_testcompile2.o
 TMPFILE3o=out/tmp_testcompile3.o
 
+this_prog=$(basename $0)
+report_error() {
+  (1>&2 echo "** $this_prog: $*" )
+}
+
 # Test if ld's alignment handling is correct.  This is a known problem
 # with the linker that ships with Ubuntu 11.04.
 cat - > $TMPFILE1 <<EOF
@@ -30,13 +35,13 @@ EOF
 $CC -O -g -c $TMPFILE1 -o $TMPFILE1o > /dev/null 2>&1
 $LD -T $TMPFILE1_ld $TMPFILE1o -o $TMPFILE2o > /dev/null 2>&1
 if [ $? -ne 0 ]; then
-    echo "The version of LD on this system does not properly handle" > /dev/fd/2
-    echo "alignments.  As a result, this project can not be built." > /dev/fd/2
-    echo "" > /dev/fd/2
-    echo "The problem may be the result of this LD bug report:" > /dev/fd/2
-    echo " http://sourceware.org/bugzilla/show_bug.cgi?id=12726" > /dev/fd/2
-    echo "" > /dev/fd/2
-    echo "Please update to a working version of binutils and retry." > /dev/fd/2
+    report_error "The version of LD on this system does not properly handle"
+    report_error "alignments.  As a result, this project can not be built."
+    report_error ""
+    report_error "The problem may be the result of this LD bug report:"
+    report_error " http://sourceware.org/bugzilla/show_bug.cgi?id=12726"
+    report_error "" >&2
+    report_error "Please update to a working version of binutils and retry."
     echo -1
     exit 0
 fi
@@ -45,7 +50,7 @@ fi
 # support the whole-program optimization - detect that.
 $CC -fwhole-program -S -o /dev/null -xc /dev/null > /dev/null 2>&1
 if [ $? -ne 0 ]; then
-    echo "  Working around no -fwhole-program" > /dev/fd/2
+    report_error "  Working around no -fwhole-program"
     echo 2
     exit 0
 fi
@@ -69,7 +74,7 @@ EOF
 $CC -Os -c -fwhole-program $TMPFILE2 -o $TMPFILE2o > /dev/null 2>&1
 $CC -nostdlib -Os $TMPFILE1o $TMPFILE2o -o $TMPFILE3o > /dev/null 2>&1
 if [ $? -ne 0 ]; then
-    echo "  Working around non-functional -fwhole-program" > /dev/fd/2
+    report_error "  Working around non-functional -fwhole-program"
     echo 2
     exit 0
 fi
@@ -104,7 +109,7 @@ $CC -O -g -fwhole-program -combine -c $TMPFILE1 $TMPFILE2 -o $TMPFILE1o > /dev/n
 if [ $? -eq 0 ]; then
     echo 0
 else
-    echo "  Working around non-functional -combine" > /dev/fd/2
+    report_error "  Working around non-functional -combine"
     echo 1
 fi
 
