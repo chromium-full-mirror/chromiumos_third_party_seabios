@@ -174,7 +174,7 @@ memcpy_far(u16 d_seg, void *d_far, u16 s_seg, const void *s_far, size_t len)
         : "cc", "memory");
 }
 
-inline void
+void
 memcpy_fl(void *d_fl, const void *s_fl, size_t len)
 {
     if (MODESEGMENT)
