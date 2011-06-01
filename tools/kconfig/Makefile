@@ -111,7 +111,7 @@ savedefconfig: $(obj)/conf
 
 defconfig: $(obj)/conf
 	@echo "  Build default config"
-	$(Q)$< --defconfig=/dev/null $(Kconfig)
+	$(Q)$< --defconfig=default.config $(Kconfig)
 
 # Help text used by make help
 help:
