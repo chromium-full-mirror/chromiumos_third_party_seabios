@@ -45,6 +45,19 @@ menu "General Features"
         default 2500
         help
             Amount of time (in ms) to wait at menu before selecting normal boot.
+    choice
+        prompt "Bootmenu key"
+        default BOOTMENU_KEY_F2
+        depends on BOOTMENU
+    config BOOTMENU_KEY_F2
+        bool "<F2>"
+        help
+            Use the <F2> key to enter the boot menu.
+    config BOOTMENU_KEY_ESC
+        bool "<ESC>"
+        help
+            Use the <ESC> key to enter the boot menu.
+    endchoice
     config BOOTSPLASH
         depends on BOOTMENU
         bool "Graphical boot splash screen"
