@@ -9,7 +9,7 @@
 //#define CONFIG_CPUNAME8 "QEMUCPU "
 //#define CONFIG_APPNAME6 "QEMU  "
 //#define CONFIG_APPNAME4 "QEMU"
-#define CONFIG_APPNAME  "Bochs"
+#define CONFIG_APPNAME  "coreboot 4.0/ChromeOS"
 #define CONFIG_CPUNAME8 "BOCHSCPU"
 #define CONFIG_APPNAME6 "BOCHS "
 #define CONFIG_APPNAME4 "BXPC"
