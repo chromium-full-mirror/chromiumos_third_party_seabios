@@ -368,6 +368,14 @@ boot_add_cbfs(void *data, const char *desc, int prio)
  * Boot menu and BCV execution
  ****************************************************************/
 
+#if CONFIG_BOOTMENU_KEY_F2
+#define MENU_KEY_SCANCODE   0x86
+#define MENU_KEY            "F2"
+#elif CONFIG_BOOTMENU_KEY_ESC
+#define MENU_KEY_SCANCODE   0x01
+#define MENU_KEY            "ESC"
+#endif
+
 // Show IPL option menu.
 static void
 interactive_bootmenu(void)
@@ -378,13 +386,13 @@ interactive_bootmenu(void)
     while (get_keystroke(0) >= 0)
         ;
 
-    printf("Press F12 for boot menu.\n\n");
+    printf("Press " MENU_KEY " for boot menu.\n\n");
 
     enable_bootsplash();
     int scan_code = get_keystroke(CONFIG_BOOTMENU_WAIT);
     disable_bootsplash();
-    if (scan_code != 0x86)
-        /* not F12 */
+    if (scan_code != MENU_KEY_SCANCODE)
+        /* not ESC */
         return;
 
     while (get_keystroke(0) >= 0)
