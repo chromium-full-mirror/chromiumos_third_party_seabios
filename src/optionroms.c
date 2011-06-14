@@ -242,8 +242,8 @@ u32 map_oprom_vendev(u32 vendev)
     u32 new_vendev=vendev;
 
     switch(vendev) {
-    case 0x80118086:
-        new_vendev=0x80018086;
+    case 0xa0118086:
+        new_vendev=0xa0018086;
         break;
     }
 
