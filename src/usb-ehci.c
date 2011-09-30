@@ -257,10 +257,6 @@ ehci_init(struct pci_device *pci, int busid, struct pci_device *comppci)
     u32 baseaddr = pci_config_readl(bdf, PCI_BASE_ADDRESS_0);
     struct ehci_caps *caps = (void*)(baseaddr & PCI_BASE_ADDRESS_MEM_MASK);
     u32 hcc_params = readl(&caps->hccparams);
-    if (hcc_params & HCC_64BIT_ADDR) {
-        dprintf(1, "No support for 64bit EHCI\n");
-        return -1;
-    }
 
     struct usb_ehci_s *cntl = malloc_tmphigh(sizeof(*cntl));
     if (!cntl) {
@@ -280,6 +276,10 @@ ehci_init(struct pci_device *pci, int busid, struct pci_device *comppci)
 
     pci_config_maskw(bdf, PCI_COMMAND, 0, PCI_COMMAND_MASTER);
 
+    if (hcc_params & HCC_64BIT_ADDR) {
+        dprintf(1, "64bit EHCI controller\n");
+        writel(&cntl->regs->ctrldssegment, 0);
+    }
     // XXX - check for and disable SMM control?
 
     // Find companion controllers.

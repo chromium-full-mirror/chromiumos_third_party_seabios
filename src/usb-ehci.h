@@ -102,7 +102,7 @@ struct ehci_qh {
     u32 alt_next;
     u32 token;
     u32 buf[5];
-    // u32 buf_hi[5];
+    u32 buf_hi[5];
 } PACKED;
 
 #define QH_CONTROL       (1 << 27)
@@ -133,14 +133,15 @@ struct ehci_qh {
 #define EHCI_PTR_QH             0x0002
 
 
-#define EHCI_QTD_ALIGN 32
+#define EHCI_QTD_ALIGN 64
 
 struct ehci_qtd {
     u32 qtd_next;
     u32 alt_next;
     u32 token;
     u32 buf[5];
-    //u32 buf_hi[5];
+    u32 buf_hi[5];
+    u32 _align[3];
 } PACKED;
 
 #define QTD_TOGGLE      (1 << 31)
