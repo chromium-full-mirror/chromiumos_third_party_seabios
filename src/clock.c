@@ -486,6 +486,15 @@ handle_1a07(struct bregs *regs)
     set_success(regs);
 }
 
+// TCG : TPM functions
+static void
+handle_1abb(struct bregs *regs)
+{
+    dprintf(3, "tcpa API function 0x%02x Magic EBX %x\n", regs->al, regs->ebx);
+    // returns function not supported : AH = 86h
+    set_code_invalid_silent(regs, 0x86);
+}
+
 // Unsupported
 static void
 handle_1aXX(struct bregs *regs)
@@ -508,6 +517,7 @@ handle_1a(struct bregs *regs)
     case 0x06: handle_1a06(regs); break;
     case 0x07: handle_1a07(regs); break;
     case 0xb1: handle_1ab1(regs); break;
+    case 0xbb: handle_1abb(regs); break;
     default:   handle_1aXX(regs); break;
     }
 }
