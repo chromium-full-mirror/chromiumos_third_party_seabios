@@ -239,7 +239,7 @@ struct extended_bios_data_area_s {
     u16 boot_sequence;
 
     // Stack space available for code that needs it.
-    u8 extra_stack[512] __aligned(8);
+    u8 extra_stack[2048] __aligned(8);
 } PACKED;
 
 // The initial size and location of EBDA
