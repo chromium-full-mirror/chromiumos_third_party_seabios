@@ -34,7 +34,7 @@ init_dma(void)
 void VISIBLE16
 handle_resume(void)
 {
-    debug_serial_setup();
+    debug_setup();
     int status = inb_cmos(CMOS_RESET_CODE);
     outb_cmos(0, CMOS_RESET_CODE);
     dprintf(1, "In resume (status=%d)\n", status);

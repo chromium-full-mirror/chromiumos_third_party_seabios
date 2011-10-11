@@ -11,11 +11,11 @@
 #include "bregs.h" // struct bregs
 #include "config.h" // CONFIG_*
 #include "biosvar.h" // GET_GLOBAL
+#include "pci.h" // pci_find_device
 
 struct putcinfo {
     void (*func)(struct putcinfo *info, char c);
 };
-
 
 /****************************************************************
  * Debug output
@@ -23,7 +23,10 @@ struct putcinfo {
 
 #define DEBUG_TIMEOUT 100000
 
-void
+#define OXPCIE_COM1 (GET_GLOBAL(oxpcie_bar) + 0x1000)
+u32 oxpcie_bar VAR16VISIBLE;
+
+static void
 debug_serial_setup(void)
 {
     if (!CONFIG_DEBUG_SERIAL)
@@ -69,29 +72,155 @@ debug_serial_flush(void)
             return;
 }
 
-// Write a character to debug port(s).
 static void
-putc_debug(struct putcinfo *action, char c)
+debug_serial_oxford_setup_32(void)
+{
+    if (!CONFIG_DEBUG_SERIAL_OXFORD)
+        return;
+
+    struct pci_device *oxpcie_dev;
+    oxpcie_bar = 0;
+    // Detect Startech MPEX1S952
+    oxpcie_dev = pci_find_device(0x1415, 0xc158);
+    if (!oxpcie_dev) // Startech PEX1S1PMINI
+        oxpcie_dev = pci_find_device(0x1415, 0xc11b);
+    if (oxpcie_dev)
+        oxpcie_bar = pci_config_readl(oxpcie_dev->bdf, 0x10);
+    if (!oxpcie_bar)
+        return;
+    // setup for serial logging: 8N1
+    volatile u8 *uart = (u8 *)OXPCIE_COM1;
+    u8 oldparam, newparam = 0x03;
+    oldparam = GET_FLATPTR(uart[SEROFF_LCR]);
+    SET_FLATPTR(uart[SEROFF_LCR], newparam);
+    // Disable irqs
+    u8 oldier, newier = 0;
+    oldier = GET_FLATPTR(uart[SEROFF_IER]);
+    SET_FLATPTR(uart[SEROFF_IER], newier);
+
+    if (oldparam != newparam || oldier != newier)
+        dprintf(1, "Changing serial settings was %x/%x now %x/%x\n"
+                , oldparam, oldier, newparam, newier);
+}
+
+static void
+debug_serial_oxford_setup(void)
+{
+    if (MODE16) {
+        extern void  _cfunc32flat_debug_serial_oxford_setup_32(void);
+        call32(_cfunc32flat_debug_serial_oxford_setup_32, 0, -1);
+    } else {
+        debug_serial_oxford_setup_32();
+    }
+}
+
+// Write a character to the serial port.
+void
+debug_serial_oxford_32(char c)
+{
+    volatile u8 *uart = (u8 *)OXPCIE_COM1;
+
+    if (!CONFIG_DEBUG_SERIAL_OXFORD)
+        return;
+    if (!oxpcie_bar)
+        return;
+
+    int timeout = DEBUG_TIMEOUT;
+    while ((GET_FLATPTR(uart[SEROFF_LSR]) & 0x60) != 0x60)
+        if (!timeout--)
+            // Ran out of time.
+            return;
+    SET_FLATPTR(uart[SEROFF_DATA], c);
+}
+
+static void
+debug_serial_oxford(char c)
+{
+    if (MODE16) {
+        extern void  _cfunc32flat_debug_serial_oxford_32(char c);
+        call32(_cfunc32flat_debug_serial_oxford_32, (u32)c, -1);
+    } else {
+        debug_serial_oxford_32(c);
+    }
+}
+
+// Make sure all serial port writes have been completely sent.
+void
+debug_serial_oxford_flush_32(void)
+{
+    u8 *uart = (u8 *)OXPCIE_COM1;
+
+    if (!CONFIG_DEBUG_SERIAL_OXFORD)
+        return;
+    if (!oxpcie_bar)
+        return;
+    int timeout = DEBUG_TIMEOUT;
+
+    while ((GET_FLATPTR(uart[SEROFF_LSR]) & 0x40) != 0x40)
+        if (!timeout--)
+            // Ran out of time.
+            return;
+}
+
+static void
+debug_serial_oxford_flush(void)
+{
+    if (MODE16) {
+        extern void  _cfunc32flat_debug_serial_oxford_flush_32(void);
+        call32(_cfunc32flat_debug_serial_oxford_flush_32, 0, -1);
+    } else {
+        debug_serial_oxford_flush_32();
+    }
+}
+
+void
+debug_setup(void)
 {
     if (! CONFIG_DEBUG_LEVEL)
         return;
+    if (CONFIG_DEBUG_SERIAL)
+        debug_serial_setup();
+    if (CONFIG_DEBUG_SERIAL_OXFORD)
+        debug_serial_oxford_setup();
+}
+
+// Write a character to debug port(s).
+static void
+debug_putc(struct putcinfo *action, char c)
+{
+    if (! CONFIG_DEBUG_LEVEL)
+        return;
+    if (c == '\n')
+        debug_putc(action, '\r');
     if (! CONFIG_COREBOOT)
         // Send character to debug port.
         outb(c, PORT_BIOS_DEBUG);
-    if (c == '\n')
-        debug_serial('\r');
-    debug_serial(c);
+    if (CONFIG_DEBUG_SERIAL)
+        debug_serial(c);
+    if (CONFIG_DEBUG_SERIAL_OXFORD)
+        debug_serial_oxford(c);
 }
 
-// In segmented mode just need a dummy variable (putc_debug is always
+static void
+debug_flush(void)
+{
+    if (! CONFIG_DEBUG_LEVEL)
+        return;
+    if (CONFIG_DEBUG_SERIAL)
+        debug_serial_flush();
+    if (CONFIG_DEBUG_SERIAL_OXFORD)
+        debug_serial_oxford_flush();
+}
+
+// In segmented mode just need a dummy variable (debug_putc is always
 // used anyway), and in 32bit flat mode need a pointer to the 32bit
-// instance of putc_debug().
+// instance of debug_putc().
 #if MODE16
 static struct putcinfo debuginfo VAR16;
 #elif MODESEGMENT
 static struct putcinfo debuginfo VAR32SEG;
 #else
-static struct putcinfo debuginfo = { putc_debug };
+static struct putcinfo debuginfo = { debug_putc };
 #endif
 
 
@@ -116,7 +245,7 @@ static void
 putc_screen(struct putcinfo *action, char c)
 {
     if (ScreenAndDebug)
-        putc_debug(&debuginfo, c);
+        debug_putc(&debuginfo, c);
     if (c == '\n')
         screenc('\r');
     screenc(c);
@@ -135,7 +264,7 @@ putc(struct putcinfo *action, char c)
 {
     if (MODESEGMENT) {
         // Only debugging output supported in segmented mode.
-        putc_debug(action, c);
+        debug_putc(action, c);
         return;
     }
 
@@ -324,7 +453,7 @@ panic(const char *fmt, ...)
         va_start(args, fmt);
         bvprintf(&debuginfo, fmt, args);
         va_end(args);
-        debug_serial_flush();
+        debug_flush();
     }
 
     // XXX - use PANIC PORT.
@@ -341,10 +470,10 @@ __dprintf(const char *fmt, ...)
         struct thread_info *cur = getCurThread();
         if (cur != &MainThread) {
             // Show "thread id" for this debug message.
-            putc_debug(&debuginfo, '|');
+            debug_putc(&debuginfo, '|');
             puthex(&debuginfo, (u32)cur, 8, 0);
-            putc_debug(&debuginfo, '|');
-            putc_debug(&debuginfo, ' ');
+            debug_putc(&debuginfo, '|');
+            debug_putc(&debuginfo, ' ');
         }
     }
 
@@ -352,7 +481,7 @@ __dprintf(const char *fmt, ...)
     va_start(args, fmt);
     bvprintf(&debuginfo, fmt, args);
     va_end(args);
-    debug_serial_flush();
+    debug_flush();
 }
 
 void
@@ -364,7 +493,7 @@ printf(const char *fmt, ...)
     bvprintf(&screeninfo, fmt, args);
     va_end(args);
     if (ScreenAndDebug)
-        debug_serial_flush();
+        debug_flush();
 }
 
 
@@ -455,7 +584,7 @@ hexdump(const void *d, int len)
         d+=4;
     }
     putc(&debuginfo, '\n');
-    debug_serial_flush();
+    debug_flush();
 }
 
 static void
@@ -479,7 +608,7 @@ __debug_isr(const char *fname)
 {
     puts_cs(&debuginfo, fname);
     putc(&debuginfo, '\n');
-    debug_serial_flush();
+    debug_flush();
 }
 
 // Function called on handler startup.
