@@ -14,8 +14,9 @@
 
 #define VH_VIA 1
 #define VH_INTEL 2
-#define VH_GOOGLE 3
-#define VH_EDISON 4
+#define VH_ALEX 3
+#define VH_STUMPY 4
+#define VH_LUMPY 5
 
 int VGAHookHandlerType VAR16VISIBLE;
 
@@ -249,9 +250,9 @@ getac_setup(struct pci_device *pci)
 }
 
 static void
-google_155f(struct bregs *regs)
+alex_155f(struct bregs *regs)
 {
-    dprintf(1, "Executing Google specific interrupt %02x.\n", regs->al);
+    dprintf(1, "Executing Alex specific interrupt %02x.\n", regs->al);
     switch (regs->al) {
     case 0x21:
     case 0x22:
@@ -263,15 +264,15 @@ google_155f(struct bregs *regs)
 }
 
 static void
-google_setup(struct pci_device *pci)
+alex_setup(struct pci_device *pci)
 {
-    VGAHookHandlerType = VH_GOOGLE;
+    VGAHookHandlerType = VH_ALEX;
 }
 
 static void
-edison_155f(struct bregs *regs)
+stumpy_155f(struct bregs *regs)
 {
-    dprintf(1, "Executing Edison VGA hooks interrupt %02x.\n", regs->al);
+    dprintf(1, "Executing Stumpy VGA hooks interrupt %02x.\n", regs->al);
     switch (regs->al) {
     case 0x34:
         /*
@@ -302,7 +303,98 @@ edison_155f(struct bregs *regs)
         regs->eax &= 0xffff0000;
         regs->eax |= 0x005f;
         regs->ecx &= 0xffff0000;
-        regs->ecx |= 0x00ff;
+        set_success(regs);
+        break;
+    case 0x51:
+        /*
+         * Hook to select active LFP configuration:
+         *  00h = No LVDS, VBIOS does not enable LVDS
+         *  01h = Int-LVDS, LFP driven by integrated LVDS decoder
+         *  02h = SVDO-LVDS, LFP driven by SVDO decoder
+         *  03h = eDP, LFP Driven by Int-DisplayPort encoder
+         */
+        regs->eax &= 0xffff0000;
+        regs->eax |= 0x005f;
+        regs->ecx &= 0xffff0000;
+        regs->ecx |= 0x0003;
+        set_success(regs);
+        break;
+    case 0x70:
+        switch ((regs->ecx >> 8) & 0xff) {
+        case 0:
+            /* Get Mux */
+            regs->eax &= 0xffff0000;
+            regs->eax |= 0x005f;
+            regs->ecx &= 0xffff0000;
+            regs->ecx |= 0x0000;
+            set_success(regs);
+            break;
+        case 1:
+            /* Set Mux */
+            regs->eax &= 0xffff0000;
+            regs->eax |= 0x005f;
+            regs->ecx &= 0xffff0000;
+            regs->ecx |= 0x0000;
+            set_success(regs);
+            break;
+        case 2:
+            /* Get SG/Non-SG mode */
+            regs->eax &= 0xffff0000;
+            regs->eax |= 0x005f;
+            regs->ecx &= 0xffff0000;
+            regs->ecx |= 0x0000;
+            set_success(regs);
+            break;
+        default:
+            /* Interrupt was not handled */
+            handle_155fXX(regs);
+            break;
+        }
+        break;
+    default: handle_155fXX(regs); break;
+    }
+}
+
+static void
+stumpy_setup(struct pci_device *pci)
+{
+    VGAHookHandlerType = VH_STUMPY;
+}
+
+static void
+lumpy_155f(struct bregs *regs)
+{
+    dprintf(1, "Executing Stumpy VGA hooks interrupt %02x.\n", regs->al);
+    switch (regs->al) {
+    case 0x34:
+        /*
+         * Set Panel Fitting Hook:
+         *  bit 2 = Graphics Stretching
+         *  bit 1 = Text Stretching
+         *  bit 0 = Centering (do not set with bit1 or bit2)
+         *  0     = video bios default
+         */
+        regs->eax &= 0xffff0000;
+        regs->eax |= 0x005f;
+        regs->ecx &= 0xffffff00;
+        regs->ecx |= 0x00;
+        set_success(regs);
+        break;
+    case 0x35:
+        /*
+         * Boot Display Device Hook:
+         *  bit 0 = CRT
+         *  bit 1 = TV
+         *  bit 2 = EFP *
+         *  bit 3 = LFP
+         *  bit 4 = CRT2
+         *  bit 5 = TV2
+         *  bit 6 = EFP2 *
+         *  bit 7 = LFP2
+         */
+        regs->eax &= 0xffff0000;
+        regs->eax |= 0x005f;
+        regs->ecx &= 0xffff0000;
         set_success(regs);
         break;
     case 0x51:
@@ -356,9 +448,9 @@ edison_155f(struct bregs *regs)
 }
 
 static void
-edison_setup(struct pci_device *pci)
+lumpy_setup(struct pci_device *pci)
 {
-    VGAHookHandlerType = VH_EDISON;
+    VGAHookHandlerType = VH_LUMPY;
 }
 
 /****************************************************************
@@ -376,11 +468,12 @@ handle_155f(struct bregs *regs)
 
     int htype = GET_GLOBAL(VGAHookHandlerType);
     switch (htype) {
-    case VH_VIA:   via_155f(regs); break;
-    case VH_INTEL: intel_155f(regs); break;
-    case VH_GOOGLE: google_155f(regs); break;
-    case VH_EDISON: edison_155f(regs); break;
-    default:       handle_155fXX(regs); break;
+    case VH_VIA:    via_155f(regs); break;
+    case VH_INTEL:  intel_155f(regs); break;
+    case VH_ALEX:   alex_155f(regs); break;
+    case VH_STUMPY: stumpy_155f(regs); break;
+    case VH_LUMPY:  lumpy_155f(regs); break;
+    default:        handle_155fXX(regs); break;
     }
 }
 
@@ -397,12 +490,12 @@ vgahook_setup(struct pci_device *pci)
         getac_setup(pci);
     else if (strcmp(CBvendor, "RODA") == 0 && strcmp(CBpart, "RK886EX") == 0)
         roda_setup(pci);
-    else if (strcmp(CBvendor, "Google") == 0 && strcmp(CBpart, "CR-48") == 0)
-        google_setup(pci);
-    else if (strcmp(CBvendor, "Samsung") == 0 && strcmp(CBpart, "Alex") == 0)
-        google_setup(pci);
-    else if (strcmp(CBvendor, "SAMSUNG") == 0 && strcmp(CBpart, "Edison") == 0)
-        edison_setup(pci);
+    else if (strcmp(CBvendor, "SAMSUNG") == 0 && strcmp(CBpart, "Alex") == 0)
+        alex_setup(pci);
+    else if (strcmp(CBvendor, "SAMSUNG") == 0 && strcmp(CBpart, "Stumpy") == 0)
+        stumpy_setup(pci);
+    else if (strcmp(CBvendor, "SAMSUNG") == 0 && strcmp(CBpart, "Lumpy") == 0)
+        lumpy_setup(pci);
     else if (pci->vendor == PCI_VENDOR_ID_VIA)
         via_setup(pci);
     else if (pci->vendor == PCI_VENDOR_ID_INTEL)
