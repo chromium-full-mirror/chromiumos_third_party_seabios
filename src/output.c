@@ -72,9 +72,10 @@ debug_serial_flush(void)
             return;
 }
 
-static void
+void   VISIBLE32FLAT
 debug_serial_oxford_setup_32(void)
 {
+ASSERT32FLAT();
     if (!CONFIG_DEBUG_SERIAL_OXFORD)
         return;
 
@@ -109,15 +110,17 @@ debug_serial_oxford_setup(void)
     if (MODE16) {
         extern void  _cfunc32flat_debug_serial_oxford_setup_32(void);
         call32(_cfunc32flat_debug_serial_oxford_setup_32, 0, -1);
+    } else if (MODESEGMENT) {
     } else {
         debug_serial_oxford_setup_32();
     }
 }
 
 // Write a character to the serial port.
-void
+void  VISIBLE32FLAT
 debug_serial_oxford_32(char c)
 {
+ASSERT32FLAT();
     volatile u8 *uart = (u8 *)OXPCIE_COM1;
 
     if (!CONFIG_DEBUG_SERIAL_OXFORD)
@@ -139,15 +142,17 @@ debug_serial_oxford(char c)
     if (MODE16) {
         extern void  _cfunc32flat_debug_serial_oxford_32(char c);
         call32(_cfunc32flat_debug_serial_oxford_32, (u32)c, -1);
+    } else if (MODESEGMENT) {
     } else {
         debug_serial_oxford_32(c);
     }
 }
 
 // Make sure all serial port writes have been completely sent.
-void
+void VISIBLE32FLAT
 debug_serial_oxford_flush_32(void)
 {
+ASSERT32FLAT();
     u8 *uart = (u8 *)OXPCIE_COM1;
 
     if (!CONFIG_DEBUG_SERIAL_OXFORD)
@@ -162,12 +167,13 @@ debug_serial_oxford_flush_32(void)
             return;
 }
 
-static void
+void
 debug_serial_oxford_flush(void)
 {
     if (MODE16) {
         extern void  _cfunc32flat_debug_serial_oxford_flush_32(void);
         call32(_cfunc32flat_debug_serial_oxford_flush_32, 0, -1);
+    } else if (MODESEGMENT) {
     } else {
         debug_serial_oxford_flush_32();
     }
