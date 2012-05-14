@@ -435,6 +435,7 @@ ehci_alloc_intr_pipe(struct usbdevice_s *usbdev
         goto fail;
     }
     memset(pipe, 0, sizeof(*pipe));
+    memset(data, 0, maxpacket * count);
     ehci_desc2pipe(pipe, usbdev, epdesc);
     pipe->next_td = pipe->tds = tds;
     pipe->data = data;
@@ -448,6 +449,10 @@ ehci_alloc_intr_pipe(struct usbdevice_s *usbdev
         td->token = (ehci_explen(maxpacket) | QTD_STS_ACTIVE
                      | QTD_PID_IN | ehci_maxerr(3));
         td->buf[0] = (u32)data + maxpacket * i;
+        td->buf[1] = 0;
+        td->buf[2] = 0;
+        td->buf[3] = 0;
+        td->buf[4] = 0;
     }
 
     // Add to interrupt schedule.
@@ -717,6 +722,10 @@ ehci_poll_intr(struct usb_pipe *p, void *data)
     struct ehci_qtd *next = (void*)(GET_FLATPTR(td->qtd_next) & ~EHCI_PTR_BITS);
     SET_FLATPTR(pipe->next_td, next);
     SET_FLATPTR(td->buf[0], (u32)tddata);
+    SET_FLATPTR(td->buf[1], 0);
+    SET_FLATPTR(td->buf[2], 0);
+    SET_FLATPTR(td->buf[3], 0);
+    SET_FLATPTR(td->buf[4], 0);
     barrier();
     SET_FLATPTR(td->token, (ehci_explen(maxpacket) | QTD_STS_ACTIVE
                             | QTD_PID_IN | ehci_maxerr(3)));
