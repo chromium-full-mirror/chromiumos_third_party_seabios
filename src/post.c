@@ -228,6 +228,7 @@ maininit(void)
 
     // Initialize pci
     pci_setup();
+    debug_setup();
     smm_init();
 
     // Setup Xen hypercalls
@@ -355,7 +356,7 @@ dopost(void)
 void VISIBLE32FLAT
 handle_post(void)
 {
-    debug_serial_setup();
+    debug_setup();
     dprintf(1, "Start bios (version %s)\n", VERSION);
 
     // Enable CPU caching

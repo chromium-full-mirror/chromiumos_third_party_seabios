@@ -664,7 +664,7 @@ do_boot(u16 seq_nr)
 void VISIBLE32FLAT
 handle_18(void)
 {
-    debug_serial_setup();
+    debug_setup();
     debug_enter(NULL, DEBUG_HDL_18);
     u16 ebda_seg = get_ebda_seg();
     u16 seq = GET_EBDA2(ebda_seg, boot_sequence) + 1;
@@ -676,7 +676,7 @@ handle_18(void)
 void VISIBLE32FLAT
 handle_19(void)
 {
-    debug_serial_setup();
+    debug_setup();
     debug_enter(NULL, DEBUG_HDL_19);
     SET_EBDA(boot_sequence, 0);
     do_boot(0);

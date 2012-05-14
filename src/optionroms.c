@@ -48,7 +48,7 @@ __callrom(struct rom_header *rom, u16 offset, u16 bdf)
     call16big(&br);
     finish_preempt();
 
-    debug_serial_setup();
+    debug_setup();
 }
 
 // Execute a given option rom at the standard entry vector.

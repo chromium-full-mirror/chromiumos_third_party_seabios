@@ -370,4 +370,12 @@ menu "Debugging"
         help
             Bochs uses the 0x0402 address by default, whereas Xen
             makes the 0xe9 IO address available for guests use.
+
+    config DEBUG_SERIAL_OXFORD
+        depends on DEBUG_LEVEL != 0
+        bool "OXPCIe 952 serial port debugging"
+        default n
+        help
+            Send debugging information to serial port.
+
 endmenu
