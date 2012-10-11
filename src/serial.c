@@ -23,7 +23,7 @@ detect_serial(u16 port, u8 timeout, u8 count)
     if (ier != 0x02 && ier != 0)
         return 0;
     u8 iir = inb(port+SEROFF_IIR);
-    dprintf(4, "IIR is %x, want not all ones\n");
+    dprintf(4, "IIR is %x, want not all ones\n", iir);
     if ((iir & 0x3f) == 0x3f)
         return 0;
 
