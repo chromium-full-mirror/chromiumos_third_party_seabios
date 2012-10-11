@@ -85,7 +85,20 @@ menu "General Features"
         default y
         help
             Support CBFS files compressed using the lzma decompression
-            algorighm.
+            algorithm.
+    config NON_DEFAULT_CBFS
+        depends on COREBOOT_FLASH
+        bool "CBFS support at non-default position"
+        default n
+        help
+            Support for loading CBFS from a position other than
+            4GB-ROMSIZE
+    config CBFS_HEADER
+        hex "CBFS master header location" if NON_DEFAULT_CBFS
+        default 0xFFFFFFFC if !NON_DEFAULT_CBFS
+        help
+            Address to look for the CBFS master header
+
     config FLASH_FLOPPY
         depends on COREBOOT_FLASH
         bool "Floppy images in CBFS"
