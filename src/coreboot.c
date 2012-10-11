@@ -272,7 +272,7 @@ ulzma(u8 *dst, u32 maxlen, const u8 *src, u32 srclen)
  ****************************************************************/
 
 #define CBFS_HEADER_MAGIC 0x4F524243
-#define CBFS_HEADPTR_ADDR 0xFFFFFFFc
+#define CBFS_HEADPTR_ADDR CONFIG_CBFS_HEADER
 #define CBFS_VERSION1 0x31313131
 
 struct cbfs_header {
@@ -319,7 +319,9 @@ struct cbfs_file {
 static struct cbfs_file *
 cbfs_verify(struct cbfs_file *file)
 {
-    if (file < (struct cbfs_file *)(0xFFFFFFFF - ntohl(CBHDR->romsize)))
+    unsigned long cbfs_end = CBFS_HEADPTR_ADDR + 3;
+
+    if (file < (struct cbfs_file *)(cbfs_end - ntohl(CBHDR->romsize)))
         return NULL;
     u64 magic = file->magic;
     if (magic == CBFS_FILE_MAGIC) {
@@ -335,7 +337,9 @@ cbfs_getfirst(void)
 {
     if (! CBHDR)
         return NULL;
-    return cbfs_verify((void *)(0 - ntohl(CBHDR->romsize) + ntohl(CBHDR->offset)));
+    void *first_file = (void *)(CBFS_HEADPTR_ADDR + 4
+                - ntohl(CBHDR->romsize) + ntohl(CBHDR->offset));
+    return cbfs_verify(first_file);
 }
 
 // Return the file after the given file.
