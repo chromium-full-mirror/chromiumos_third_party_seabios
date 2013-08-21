@@ -532,6 +532,10 @@ boot_prep(void)
 static void
 call_boot_entry(struct segoff_s bootsegip, u8 bootdrv)
 {
+    /* Issue SMI to Coreboot to lock down ME and registers */
+    if (CONFIG_COREBOOT)
+        outb(0xcb, 0xb2);
+
     dprintf(1, "Booting from %04x:%04x\n", bootsegip.seg, bootsegip.offset);
     struct bregs br;
     memset(&br, 0, sizeof(br));
