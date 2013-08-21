@@ -27,6 +27,7 @@
 #include "ps2port.h" // ps2port_setup
 #include "virtio-blk.h" // virtio_blk_setup
 #include "virtio-scsi.h" // virtio_scsi_setup
+#include "acpi_tpm_fixup.h" // acpi_tpm_fixup
 
 
 /****************************************************************
@@ -268,6 +269,7 @@ maininit(void)
     boot_prep();
 
     // Finalize data structures before boot
+    acpi_tpm_fixup();
     cdemu_setup();
     pmm_finalize();
     malloc_finalize();
