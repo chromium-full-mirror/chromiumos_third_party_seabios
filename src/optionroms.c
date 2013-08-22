@@ -196,6 +196,22 @@ u32 map_oprom_vendev(u32 vendev)
     case 0xa0118086:
         new_vendev=0xa0018086;
         break;
+
+    /* Haswell GPU IDs */
+    case 0x04028086:                /* GT1 Desktop */
+    case 0x04068086:                /* GT1 Mobile */
+    case 0x040a8086:                /* GT1 Server */
+    case 0x0a068086:                /* GT1 ULT */
+    case 0x04128086:                /* GT2 Desktop */
+    case 0x04168086:                /* GT2 Mobile */
+    case 0x041a8086:                /* GT2 Server */
+    case 0x0a168086:                /* GT2 ULT */
+    case 0x04228086:                /* GT3 Desktop */
+    case 0x04268086:                /* GT3 Mobile */
+    case 0x042a8086:                /* GT3 Server */
+    case 0x0a268086:                /* GT3 ULT */
+        new_vendev=0x04068086;      /* GT1 Mobile */
+        break;
     }
 
     return new_vendev;
@@ -210,8 +226,10 @@ static struct rom_header *
 lookup_hardcode(struct pci_device *pci)
 {
     char fname[17];
+    u32 vendev = map_oprom_vendev(pci->device << 16 | pci->vendor);
+
     snprintf(fname, sizeof(fname), "pci%04x,%04x.rom"
-             , pci->vendor, pci->device);
+             , vendev & 0xffff, vendev >> 16);
     int ret = romfile_copy(romfile_find(fname), (void*)RomEnd
                            , max_rom() - RomEnd);
     if (ret <= 0)
