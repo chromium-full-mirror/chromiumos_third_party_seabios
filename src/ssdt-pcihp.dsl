@@ -22,7 +22,7 @@ DefinitionBlock ("ssdt-pcihp.aml", "SSDT", 0x01, "BXPC", "BXSSDTPCIHP", 0x1)
            ACPI_EXTRACT_NAME_DWORD_CONST aml_adr_dword  \
            Name (_ADR, 0x##slot##0000)                  \
            ACPI_EXTRACT_METHOD_STRING aml_ej0_name      \
-           Method (_EJ0, 1) { Return(PCEJ(0x##slot)) }  \
+           Method (_EJ0, 1) { PCEJ(0x##slot) }          \
            Name (_SUN, 0x##slot)                        \
         }
 

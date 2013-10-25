@@ -220,11 +220,14 @@ $(OUT)vgabios.bin: $(OUT)vgabios.bin.raw tools/buildrom.py
 
 ################ DSDT build rules
 
+iasl-option=$(shell if test -z "`$(1) $(2) 2>&1 > /dev/null`" \
+	; then echo "$(2)"; else echo "$(3)"; fi ;)
+
 src/%.hex: src/%.dsl ./tools/acpi_extract_preprocess.py ./tools/acpi_extract.py
-	@echo "Compiling DSDT"
+	@echo "Compiling IASL $@"
 	$(Q)cpp -P $< > $(OUT)$*.dsl.i.orig
 	$(Q)$(PYTHON) ./tools/acpi_extract_preprocess.py $(OUT)$*.dsl.i.orig > $(OUT)$*.dsl.i
-	$(Q)$(IASL) -l -tc -p $(OUT)$* $(OUT)$*.dsl.i
+	$(Q)$(IASL) $(call iasl-option,$(IASL),-Pn,) -vs -l -tc -p $(OUT)$* $(OUT)$*.dsl.i
 	$(Q)$(PYTHON) ./tools/acpi_extract.py $(OUT)$*.lst > $(OUT)$*.off
 	$(Q)cat $(OUT)$*.off > $@
 

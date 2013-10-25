@@ -92,7 +92,7 @@ def aml_pkglen(offset):
     pkglenbytes = aml_pkglen_bytes(offset)
     pkglen = aml[offset] & 0x3F
     # If multibyte, first nibble only uses bits 0-3
-    if ((pkglenbytes > 0) and (pkglen & 0x30)):
+    if ((pkglenbytes > 1) and (pkglen & 0x30)):
         die("PkgLen bytes 0x%x but first nibble 0x%x expected 0x0X" %
             (pkglen, pkglen))
     offset += 1
@@ -121,7 +121,11 @@ def aml_name_string(offset):
     if (aml[offset] != 0x08):
         die( "Name offset 0x%x: expected 0x08 actual 0x%x" %
              (offset, aml[offset]));
-    return offset + 1;
+    offset += 1
+    # Block Name Modifier. Skip it.
+    if (aml[offset] == 0x5c or aml[offset] == 0x5e):
+        offset += 1
+    return offset;
 
 # Given data offset, find dword const offset
 def aml_data_dword_const(offset):
@@ -189,12 +193,12 @@ for line in fileinput.input():
     lineno = lineno + 1
     debug = "input line %d: %s" % (lineno, line)
     #ASL listing: space, then line#, then ...., then code
-    pasl = re.compile('^\s+([0-9]+)\.\.\.\.\s*')
+    pasl = re.compile('^\s+([0-9]+)(:\s\s|\.\.\.\.)\s*')
     m = pasl.search(line)
     if (m):
         add_asl(lineno, pasl.sub("", line));
     # AML listing: offset in hex, then ...., then code
-    paml = re.compile('^([0-9A-Fa-f]+)\.\.\.\.\s*')
+    paml = re.compile('^([0-9A-Fa-f]+)(:\s\s|\.\.\.\.)\s*')
     m = paml.search(line)
     if (m):
         add_aml(m.group(1), paml.sub("", line))
