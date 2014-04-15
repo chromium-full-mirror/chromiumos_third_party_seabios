@@ -1,27 +1,31 @@
 // Code to load disk image and start system boot.
 //
-// Copyright (C) 2008-2010  Kevin O'Connor <kevin@koconnor.net>
+// Copyright (C) 2008-2013  Kevin O'Connor <kevin@koconnor.net>
 // Copyright (C) 2002  MandrakeSoft S.A.
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
-#include "util.h" // dprintf
-#include "biosvar.h" // GET_EBDA
-#include "config.h" // CONFIG_*
-#include "disk.h" // cdrom_boot
+#include "block.h" // struct drive_s
 #include "bregs.h" // struct bregs
-#include "boot.h" // func defs
-#include "cmos.h" // inb_cmos
-#include "paravirt.h" // romfile_loadfile
-#include "pci.h" //pci_bdf_to_*
-#include "usb.h" // struct usbdevice_s
+#include "config.h" // CONFIG_*
+#include "fw/paravirt.h" // qemu_cfg_show_boot_menu
+#include "hw/pci.h" // pci_bdf_to_*
+#include "hw/rtc.h" // rtc_read
+#include "hw/usb.h" // struct usbdevice_s
+#include "list.h" // hlist_node
+#include "malloc.h" // free
+#include "output.h" // dprintf
+#include "romfile.h" // romfile_loadint
+#include "std/disk.h" // struct mbr_s
+#include "string.h" // memset
+#include "util.h" // irqtimer_calc
 
 
 /****************************************************************
  * Boot priority ordering
  ****************************************************************/
 
-static char **Bootorder;
+static char **Bootorder VARVERIFY32INIT;
 static int BootorderCount;
 
 static void
@@ -49,7 +53,7 @@ loadBootOrder(void)
         return;
     }
 
-    dprintf(3, "boot order:\n");
+    dprintf(1, "boot order:\n");
     i = 0;
     do {
         Bootorder[i] = f;
@@ -57,7 +61,7 @@ loadBootOrder(void)
         if (f)
             *(f++) = '\0';
         nullTrailingSpace(Bootorder[i]);
-        dprintf(3, "%d: %s\n", i+1, Bootorder[i]);
+        dprintf(1, "%d: %s\n", i+1, Bootorder[i]);
         i++;
     } while (f);
 }
@@ -121,6 +125,8 @@ build_pci_path(char *buf, int max, const char *devname, struct pci_device *pci)
 
 int bootprio_find_pci_device(struct pci_device *pci)
 {
+    if (CONFIG_CSM)
+        return csm_bootprio_pci(pci);
     if (!CONFIG_BOOTORDER)
         return -1;
     // Find pci device - for example: /pci@i0cf8/ethernet@5
@@ -145,6 +151,8 @@ int bootprio_find_scsi_device(struct pci_device *pci, int target, int lun)
 
 int bootprio_find_ata_device(struct pci_device *pci, int chanid, int slave)
 {
+    if (CONFIG_CSM)
+        return csm_bootprio_ata(pci, chanid, slave);
     if (!CONFIG_BOOTORDER)
         return -1;
     if (!pci)
@@ -159,6 +167,8 @@ int bootprio_find_ata_device(struct pci_device *pci, int chanid, int slave)
 
 int bootprio_find_fdc_device(struct pci_device *pci, int port, int fdid)
 {
+    if (CONFIG_CSM)
+        return csm_bootprio_fdc(pci, port, fdid);
     if (!CONFIG_BOOTORDER)
         return -1;
     if (!pci)
@@ -206,15 +216,21 @@ build_usb_path(char *buf, int max, struct usbhub_s *hub)
     return p;
 }
 
-int bootprio_find_usb(struct usbdevice_s *usbdev)
+int bootprio_find_usb(struct usbdevice_s *usbdev, int lun)
 {
     if (!CONFIG_BOOTORDER)
         return -1;
-    // Find usb - for example: /pci@i0cf8/usb@1,2/hub@1/network@0/ethernet@0
+    // Find usb - for example: /pci@i0cf8/usb@1,2/storage@1/channel@0/disk@0,0
     char desc[256], *p;
     p = build_pci_path(desc, sizeof(desc), "usb", usbdev->hub->cntl->pci);
     p = build_usb_path(p, desc+sizeof(desc)-p, usbdev->hub);
-    snprintf(p, desc+sizeof(desc)-p, "/*@%x", usbdev->port+1);
+    snprintf(p, desc+sizeof(desc)-p, "/storage@%x/*@0/*@0,%d"
+             , usbdev->port+1, lun);
+    int ret = find_prio(desc);
+    if (ret >= 0)
+        return ret;
+    // Try usb-host/redir - for example: /pci@i0cf8/usb@1,2/usb-host@1
+    snprintf(p, desc+sizeof(desc)-p, "/usb-*@%x", usbdev->port+1);
     return find_prio(desc);
 }
 
@@ -223,6 +239,7 @@ int bootprio_find_usb(struct usbdevice_s *usbdev)
  * Boot setup
  ****************************************************************/
 
+static int BootRetryTime;
 static int CheckFloppySig = 1;
 
 #define DEFAULT_PRIO           9999
@@ -233,19 +250,17 @@ static int DefaultHDPrio     = 103;
 static int DefaultBEVPrio    = 104;
 
 void
-boot_setup(void)
+boot_init(void)
 {
     if (! CONFIG_BOOT)
         return;
 
-    SET_EBDA(boot_sequence, 0xffff);
-
-    if (!CONFIG_COREBOOT) {
+    if (CONFIG_QEMU) {
         // On emulators, get boot order from nvram.
-        if (inb_cmos(CMOS_BIOS_BOOTFLAG1) & 1)
+        if (rtc_read(CMOS_BIOS_BOOTFLAG1) & 1)
             CheckFloppySig = 0;
-        u32 bootorder = (inb_cmos(CMOS_BIOS_BOOTFLAG2)
-                         | ((inb_cmos(CMOS_BIOS_BOOTFLAG1) & 0xf0) << 4));
+        u32 bootorder = (rtc_read(CMOS_BIOS_BOOTFLAG2)
+                         | ((rtc_read(CMOS_BIOS_BOOTFLAG1) & 0xf0) << 4));
         DefaultFloppyPrio = DefaultCDPrio = DefaultHDPrio
             = DefaultBEVPrio = DEFAULT_PRIO;
         int i;
@@ -260,6 +275,8 @@ boot_setup(void)
             }
         }
     }
+
+    BootRetryTime = romfile_loadint("etc/boot-fail-wait", 60*1000);
 
     loadBootOrder();
 }
@@ -278,9 +295,9 @@ struct bootentry_s {
     };
     int priority;
     const char *description;
-    struct bootentry_s *next;
+    struct hlist_node node;
 };
-static struct bootentry_s *BootList;
+static struct hlist_head BootList VARVERIFY32INIT;
 
 #define IPL_TYPE_FLOPPY      0x01
 #define IPL_TYPE_HARDDISK    0x02
@@ -288,6 +305,7 @@ static struct bootentry_s *BootList;
 #define IPL_TYPE_CBFS        0x20
 #define IPL_TYPE_BEV         0x80
 #define IPL_TYPE_BCV         0x81
+#define IPL_TYPE_HALT        0xf0
 
 static void
 bootentry_add(int type, int prio, u32 data, const char *desc)
@@ -307,9 +325,9 @@ bootentry_add(int type, int prio, u32 data, const char *desc)
             , be->description, type, prio, data);
 
     // Add entry in sorted order.
-    struct bootentry_s **pprev;
-    for (pprev = &BootList; *pprev; pprev = &(*pprev)->next) {
-        struct bootentry_s *pos = *pprev;
+    struct hlist_node **pprev;
+    struct bootentry_s *pos;
+    hlist_for_each_entry_pprev(pos, pprev, &BootList, node) {
         if (be->priority < pos->priority)
             break;
         if (be->priority > pos->priority)
@@ -324,8 +342,7 @@ bootentry_add(int type, int prio, u32 data, const char *desc)
                     && be->drive->cntl_id < pos->drive->cntl_id)))
             break;
     }
-    be->next = *pprev;
-    *pprev = be;
+    hlist_add(&be->node, pprev);
 }
 
 // Return the given priority if it's set - defaultprio otherwise.
@@ -382,36 +399,75 @@ boot_add_cbfs(void *data, const char *desc, int prio)
 
 
 /****************************************************************
+ * Keyboard calls
+ ****************************************************************/
+
+// See if a keystroke is pending in the keyboard buffer.
+static int
+check_for_keystroke(void)
+{
+    struct bregs br;
+    memset(&br, 0, sizeof(br));
+    br.flags = F_IF|F_ZF;
+    br.ah = 1;
+    call16_int(0x16, &br);
+    return !(br.flags & F_ZF);
+}
+
+// Return a keystroke - waiting forever if necessary.
+static int
+get_raw_keystroke(void)
+{
+    struct bregs br;
+    memset(&br, 0, sizeof(br));
+    br.flags = F_IF;
+    call16_int(0x16, &br);
+    return br.ah;
+}
+
+// Read a keystroke - waiting up to 'msec' milliseconds.
+static int
+get_keystroke(int msec)
+{
+    u32 end = irqtimer_calc(msec);
+    for (;;) {
+        if (check_for_keystroke())
+            return get_raw_keystroke();
+        if (irqtimer_check(end))
+            return -1;
+        yield_toirq();
+    }
+}
+
+
+/****************************************************************
  * Boot menu and BCV execution
  ****************************************************************/
 
 #define DEFAULT_BOOTMENU_WAIT 2500
-#if CONFIG_BOOTMENU_KEY_F2
-#define MENU_KEY_SCANCODE   0x86
-#define MENU_KEY            "F2"
-#elif CONFIG_BOOTMENU_KEY_ESC
-#define MENU_KEY_SCANCODE   0x01
-#define MENU_KEY            "ESC"
-#endif
 
 // Show IPL option menu.
-static void
+void
 interactive_bootmenu(void)
 {
-    if (! CONFIG_BOOTMENU || ! qemu_cfg_show_boot_menu())
+    // XXX - show available drives?
+
+    if (! CONFIG_BOOTMENU || !romfile_loadint("etc/show-boot-menu", 1))
         return;
 
     while (get_keystroke(0) >= 0)
         ;
 
-    printf("Press " MENU_KEY " for boot menu.\n\n");
+    char *bootmsg = romfile_loadfile("etc/boot-menu-message", NULL);
+    int menukey = romfile_loadint("etc/boot-menu-key", 0x86);
+    printf("%s", bootmsg ?: "\nPress F12 for boot menu.\n\n");
+    free(bootmsg);
 
     u32 menutime = romfile_loadint("etc/boot-menu-wait", DEFAULT_BOOTMENU_WAIT);
     enable_bootsplash();
     int scan_code = get_keystroke(menutime);
     disable_bootsplash();
-    if (scan_code != MENU_KEY_SCANCODE)
-        /* not ESC */
+    if (scan_code != menukey)
         return;
 
     while (get_keystroke(0) >= 0)
@@ -421,14 +477,13 @@ interactive_bootmenu(void)
     wait_threads();
 
     // Show menu items
-    struct bootentry_s *pos = BootList;
     int maxmenu = 0;
-    while (pos) {
+    struct bootentry_s *pos;
+    hlist_for_each_entry(pos, &BootList, node) {
         char desc[60];
         maxmenu++;
         printf("%d. %s\n", maxmenu
                , strtcpy(desc, pos->description, ARRAY_SIZE(desc)));
-        pos = pos->next;
     }
 
     // Get key press
@@ -444,14 +499,13 @@ interactive_bootmenu(void)
 
     // Find entry and make top priority.
     int choice = scan_code - 1;
-    struct bootentry_s **pprev = &BootList;
-    while (--choice)
-        pprev = &(*pprev)->next;
-    pos = *pprev;
-    *pprev = pos->next;
-    pos->next = BootList;
-    BootList = pos;
+    hlist_for_each_entry(pos, &BootList, node) {
+        if (! --choice)
+            break;
+    }
+    hlist_del(&pos->node);
     pos->priority = 0;
+    hlist_add_head(&pos->node, &BootList);
 }
 
 // BEV (Boot Execution Vector) list
@@ -479,22 +533,18 @@ add_bev(int type, u32 vector)
 
 // Prepare for boot - show menu and run bcvs.
 void
-boot_prep(void)
+bcv_prepboot(void)
 {
-    if (! CONFIG_BOOT) {
-        wait_threads();
+    if (! CONFIG_BOOT)
         return;
-    }
 
-    // XXX - show available drives?
-
-    // Allow user to modify BCV/IPL order.
-    interactive_bootmenu();
-    wait_threads();
+    int haltprio = find_prio("HALT");
+    if (haltprio >= 0)
+        bootentry_add(IPL_TYPE_HALT, haltprio, 0, "HALT");
 
     // Map drives and populate BEV list
-    struct bootentry_s *pos = BootList;
-    while (pos) {
+    struct bootentry_s *pos;
+    hlist_for_each_entry(pos, &BootList, node) {
         switch (pos->type) {
         case IPL_TYPE_BCV:
             call_bcv(pos->vector.seg, pos->vector.offset);
@@ -515,7 +565,6 @@ boot_prep(void)
             add_bev(pos->type, pos->data);
             break;
         }
-        pos = pos->next;
     }
 
     // If nothing added a floppy/hd boot - add it manually.
@@ -540,7 +589,7 @@ call_boot_entry(struct segoff_s bootsegip, u8 bootdrv)
     // Set the magic number in ax and the boot drive in dl.
     br.dl = bootdrv;
     br.ax = 0xaa55;
-    call16(&br);
+    farcall16(&br);
 }
 
 // Boot from a disk (either floppy or harddrive)
@@ -594,9 +643,8 @@ boot_cdrom(struct drive_s *drive_g)
         return;
     }
 
-    u16 ebda_seg = get_ebda_seg();
-    u8 bootdrv = GET_EBDA2(ebda_seg, cdemu.emulated_extdrive);
-    u16 bootseg = GET_EBDA2(ebda_seg, cdemu.load_segment);
+    u8 bootdrv = CDEmu.emulated_extdrive;
+    u16 bootseg = CDEmu.load_segment;
     /* Canonicalize bootseg:bootip */
     u16 bootip = (bootseg & 0x0fff) << 4;
     bootseg &= 0xf000;
@@ -608,7 +656,7 @@ boot_cdrom(struct drive_s *drive_g)
 static void
 boot_cbfs(struct cbfs_file *file)
 {
-    if (!CONFIG_COREBOOT || !CONFIG_COREBOOT_FLASH)
+    if (!CONFIG_COREBOOT_FLASH)
         return;
     printf("Booting from CBFS...\n");
     cbfs_run_payload(file);
@@ -624,19 +672,38 @@ boot_rom(u32 vector)
     call_boot_entry(so, 0);
 }
 
+// Unable to find bootable device - warn user and eventually retry.
+static void
+boot_fail(void)
+{
+    if (BootRetryTime == (u32)-1)
+        printf("No bootable device.\n");
+    else
+        printf("No bootable device.  Retrying in %d seconds.\n"
+               , BootRetryTime/1000);
+    // Wait for 'BootRetryTime' milliseconds and then reboot.
+    u32 end = irqtimer_calc(BootRetryTime);
+    for (;;) {
+        if (BootRetryTime != (u32)-1 && irqtimer_check(end))
+            break;
+        yield_toirq();
+    }
+    printf("Rebooting.\n");
+    struct bregs br;
+    memset(&br, 0, sizeof(br));
+    br.code = SEGOFF(SEG_BIOS, (u32)reset_vector);
+    farcall16big(&br);
+}
+
 // Determine next boot method and attempt a boot using it.
 static void
-do_boot(u16 seq_nr)
+do_boot(int seq_nr)
 {
     if (! CONFIG_BOOT)
         panic("Boot support not compiled in.\n");
 
-    if (seq_nr >= BEVCount) {
-        printf("No bootable device.\n");
-        // Loop with irqs enabled - this allows ctrl+alt+delete to work.
-        for (;;)
-            wait_irq();
-    }
+    if (seq_nr >= BEVCount)
+        boot_fail();
 
     // Boot the given BEV type.
     struct bev_s *ie = &BEV[seq_nr];
@@ -658,6 +725,9 @@ do_boot(u16 seq_nr)
     case IPL_TYPE_BEV:
         boot_rom(ie->vector);
         break;
+    case IPL_TYPE_HALT:
+        boot_fail();
+        break;
     }
 
     // Boot failed: invoke the boot recovery function
@@ -667,15 +737,15 @@ do_boot(u16 seq_nr)
     call16_int(0x18, &br);
 }
 
+int BootSequence VARLOW = -1;
+
 // Boot Failure recovery: try the next device.
 void VISIBLE32FLAT
 handle_18(void)
 {
-    debug_setup();
     debug_enter(NULL, DEBUG_HDL_18);
-    u16 ebda_seg = get_ebda_seg();
-    u16 seq = GET_EBDA2(ebda_seg, boot_sequence) + 1;
-    SET_EBDA2(ebda_seg, boot_sequence, seq);
+    int seq = BootSequence + 1;
+    BootSequence = seq;
     do_boot(seq);
 }
 
@@ -683,8 +753,7 @@ handle_18(void)
 void VISIBLE32FLAT
 handle_19(void)
 {
-    debug_setup();
     debug_enter(NULL, DEBUG_HDL_19);
-    SET_EBDA(boot_sequence, 0);
+    BootSequence = 0;
     do_boot(0);
 }

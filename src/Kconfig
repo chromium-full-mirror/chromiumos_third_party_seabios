@@ -4,16 +4,40 @@ mainmenu "SeaBIOS Configuration"
 
 menu "General Features"
 
+choice
+    prompt "Build Target"
+    default QEMU
+
     config COREBOOT
         bool "Build for coreboot"
-        default n
         help
             Configure as a coreboot payload.
 
-    config XEN
-        depends on !COREBOOT
-        bool "Build for Xen HVM"
+    config QEMU
+        bool "Build for QEMU/Xen/KVM/Bochs"
+        select QEMU_HARDWARE
+        help
+            Configure for an emulated machine (QEMU, Xen, KVM, or Bochs).
+
+    config CSM
+       bool "Build as Compatibilty Support Module for EFI BIOS"
+       help
+           Configure to be used by EFI firmware as Compatibility Support
+           module (CSM) to provide legacy BIOS services.
+
+endchoice
+
+    config QEMU_HARDWARE
+        bool "Support hardware found on emulators (QEMU/Xen/KVM/Bochs)" if !QEMU
         default n
+        help
+            Support virtual hardware when the code detects it is
+            running on an emulator.
+
+    config XEN
+        depends on QEMU
+        bool "Support Xen HVM"
+        default y
         help
             Configure to be used by xen hvmloader, for a HVM guest.
 
@@ -23,7 +47,7 @@ menu "General Features"
         help
             Support running hardware initialization in parallel.
     config THREAD_OPTIONROMS
-        depends on THREADS
+        depends on THREADS && !CSM
         bool "Hardware init during option ROM execution"
         default n
         help
@@ -46,19 +70,6 @@ menu "General Features"
         default y
         help
             Support an interactive boot menu at end of post.
-    choice
-        prompt "Bootmenu key"
-        default BOOTMENU_KEY_F2
-        depends on BOOTMENU
-    config BOOTMENU_KEY_F2
-        bool "<F2>"
-        help
-            Use the <F2> key to enter the boot menu.
-    config BOOTMENU_KEY_ESC
-        bool "<ESC>"
-        help
-            Use the <ESC> key to enter the boot menu.
-    endchoice
     config BOOTSPLASH
         depends on BOOTMENU
         bool "Graphical boot splash screen"
@@ -86,18 +97,15 @@ menu "General Features"
         help
             Support CBFS files compressed using the lzma decompression
             algorithm.
-    config NON_DEFAULT_CBFS
+    config CBFS_LOCATION
         depends on COREBOOT_FLASH
-        bool "CBFS support at non-default position"
-        default n
+        hex "CBFS memory end location"
+        default 0
         help
-            Support for loading CBFS from a position other than
-            4GB-ROMSIZE
-    config CBFS_HEADER
-        hex "CBFS master header location" if NON_DEFAULT_CBFS
-        default 0xFFFFFFFC if !NON_DEFAULT_CBFS
-        help
-            Address to look for the CBFS master header
+            Memory address of where the CBFS data ends.  This should
+            be zero for normal builds.  It may be a non-zero value if
+            the CBFS filesystem is at a non-standard location (eg,
+            0xffe00000 if CBFS ends 2Meg below the end of flash).
 
     config FLASH_FLOPPY
         depends on COREBOOT_FLASH
@@ -105,6 +113,35 @@ menu "General Features"
         default y
         help
             Support floppy images in coreboot flash.
+    config ENTRY_EXTRASTACK
+        bool "Use internal stack for 16bit interrupt entry points"
+        default y
+        help
+            Utilize an internal stack for all the legacy 16bit
+            interrupt entry points.  This reduces the amount of space
+            on the caller's stack that SeaBIOS uses.  This may
+            adversely impact any legacy operating systems that call
+            the BIOS in 16bit protected mode.
+
+    config MALLOC_UPPERMEMORY
+        bool "Allocate memory that needs to be in first Meg above 0xc0000"
+        default y
+        help
+            Use the "Upper Memory Block" area (0xc0000-0xf0000) for
+            internal "low memory" allocations.  If this is not
+            selected, the memory is instead allocated from the
+            "9-segment" (0x90000-0xa0000).
+
+    config ROM_SIZE
+        int "ROM size (in KB)"
+        default 0
+        help
+            Set the ROM size.  Say '0' here to make seabios figure the
+            needed size automatically.
+
+            Currently SeaBIOS will easily fit into 256 KB. To make it fit
+            it into 128 KB (which was big enouth for a long time) you'll
+            probably have to disable some featues such as xhci support.
 
 endmenu
 
@@ -134,17 +171,47 @@ menu "Hardware support"
         help
             Support for AHCI disk code.
     config VIRTIO_BLK
-        depends on DRIVES && !COREBOOT
+        depends on DRIVES && QEMU_HARDWARE
         bool "virtio-blk controllers"
         default y
         help
             Support boot from virtio-blk storage.
     config VIRTIO_SCSI
-        depends on DRIVES && !COREBOOT
+        depends on DRIVES && QEMU_HARDWARE
         bool "virtio-scsi controllers"
         default y
         help
             Support boot from virtio-scsi storage.
+    config PVSCSI
+        depends on DRIVES && QEMU_HARDWARE
+        bool "PVSCSI controllers"
+        default y
+        help
+            Support boot from Paravirtualized SCSI storage. This kind of storage
+            is mainly supported by VMware ESX hypervisor. It is commonly used
+            to allow fast storage access by communicating directly with the
+            underlying hypervisor. Enabling this type of boot will allow
+            booting directly from images imported from an ESX platform,
+            without the need to use slower emulation of storage controllers
+            such as IDE.
+    config ESP_SCSI
+        depends on DRIVES && QEMU_HARDWARE
+        bool "AMD PCscsi controllers"
+        default y
+        help
+            Support boot from AMD PCscsi storage.
+    config LSI_SCSI
+        depends on DRIVES && QEMU_HARDWARE
+        bool "lsi53c895a scsi controllers"
+        default y
+        help
+            Support boot from qemu-emulated lsi53c895a scsi storage.
+    config MEGASAS
+        depends on DRIVES
+        bool "LSI MegaRAID SAS controllers"
+        default y
+        help
+            Support boot from LSI MegaRAID SAS scsi storage.
     config FLOPPY
         depends on DRIVES
         bool "Floppy controller"
@@ -182,12 +249,24 @@ menu "Hardware support"
         default y
         help
             Support USB EHCI controllers.
+    config USB_XHCI
+        depends on USB
+        bool "USB XHCI controllers"
+        default y
+        help
+            Support USB XHCI controllers.
     config USB_MSC
         depends on USB && DRIVES
         bool "USB drives"
         default y
         help
-            Support USB disks.
+            Support USB BOT (bulk-only transport) disks.
+    config USB_UAS
+        depends on USB && DRIVES
+        bool "UAS drives"
+        default y
+        help
+            Support USB UAS (usb attached scsi) disks.
     config USB_HUB
         depends on USB
         bool "USB hubs"
@@ -219,17 +298,22 @@ menu "Hardware support"
             Support parallel ports. This also enables int 17 parallel port calls.
 
     config USE_SMM
-        depends on !COREBOOT
+        depends on QEMU
         bool "System Management Mode (SMM)"
         default y
         help
             Support System Management Mode (on emulators).
     config MTRR_INIT
-        depends on !COREBOOT
+        depends on QEMU
         bool "Initialize MTRRs"
         default y
         help
             Initialize the Memory Type Range Registers (on emulators).
+    config PMTIMER
+        bool "Use ACPI timer"
+        default y
+        help
+            Use the ACPI timer instead of the TSC for timekeeping (on qemu).
 endmenu
 
 menu "BIOS interfaces"
@@ -273,7 +357,7 @@ menu "BIOS interfaces"
         help
             Support finding and running option roms during POST.
     config OPTIONROMS_DEPLOYED
-        depends on OPTIONROMS
+        depends on OPTIONROMS && QEMU
         bool "Option roms are already at 0xc0000-0xf0000"
         default n
         help
@@ -326,17 +410,28 @@ menu "BIOS interfaces"
         default n
         help
             Disable A20 on 16bit boot.
+
+    config WRITABLE_UPPERMEMORY
+        depends on QEMU
+        bool "Make unused UMB memory read/writeable."
+        default n
+        help
+            When selected, the "Upper Memory Block" area
+            (0x90000-0xa0000) that is not used for option roms will be
+            made writable.  This allows the ram to be directly
+            modified by programs.  However, some old DOS high memory
+            managers may require the UMB region to be read-only.
+
 endmenu
 
 menu "BIOS Tables"
+    depends on QEMU
     config PIRTABLE
-        depends on !COREBOOT
         bool "PIR table"
         default y
         help
             Support generation of a PIR table in 0xf000 segment.
     config MPTABLE
-        depends on !COREBOOT
         bool "MPTable"
         default y
         help
@@ -348,14 +443,34 @@ menu "BIOS Tables"
             Support generation of SM BIOS tables.  This is also
             sometimes called DMI.
     config ACPI
-        depends on !COREBOOT
         bool "ACPI"
         default y
         help
             Support generation of ACPI tables.
+    config ACPI_DSDT
+        bool "Include default ACPI DSDT"
+        default y
+        depends on ACPI
+        help
+            Include default DSDT ACPI table in BIOS.
+            Required for QEMU 1.3 and older.
+            This option can be disabled for QEMU 1.4 and newer
+            to save some space in the ROM file.
+            If unsure, say Y.
+    config FW_ROMFILE_LOAD
+        bool "Load BIOS tables from ROM files"
+        depends on QEMU_HARDWARE
+        default y
+        help
+            Support loading BIOS firmware tables from ROM files.
+            At the moment, only ACPI tables can be loaded in this way.
+            Required for QEMU 1.7 and newer.
+            This option can be disabled for QEMU 1.6 and older
+            to save some space in the ROM file.
+            If unsure, say Y.
 endmenu
 
-source ../vgasrc/Kconfig
+source vgasrc/Kconfig
 
 menu "Debugging"
     config DEBUG_LEVEL
@@ -381,7 +496,7 @@ menu "Debugging"
             Base port for serial - generally 0x3f8, 0x2f8, 0x3e8, or 0x2e8.
 
     config DEBUG_IO
-        depends on !COREBOOT && DEBUG_LEVEL != 0
+        depends on QEMU_HARDWARE && DEBUG_LEVEL != 0
         bool "Special IO port debugging"
         default y
         help
@@ -389,19 +504,14 @@ menu "Debugging"
             information by outputing strings in a special port present in the
             IO space.
 
-    config DEBUG_IO_PORT
-        depends on DEBUG_IO
-        hex "Debug IO port address"
-        default 0x0402
+    config DEBUG_COREBOOT
+        depends on COREBOOT && DEBUG_LEVEL != 0
+        bool "coreboot cbmem debug logging"
+        default y
         help
-            Bochs uses the 0x0402 address by default, whereas Xen
-            makes the 0xe9 IO address available for guests use.
-
-    config DEBUG_SERIAL_OXFORD
-        depends on DEBUG_LEVEL != 0
-        bool "OXPCIe 952 serial port debugging"
-        default n
-        help
-            Send debugging information to serial port.
+            Send debugging information to the coreboot cbmem console buffer.
+            Needs CONFIG_CONSOLE_CBMEM in coreboot.  You can read the log
+            after boot using 'cbmem -c'.  Only 32bit code (basically every-
+            thing before booting the OS) writes to the log buffer.
 
 endmenu

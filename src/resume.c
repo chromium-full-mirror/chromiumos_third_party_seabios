@@ -4,43 +4,32 @@
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
-#include "util.h" // dprintf
-#include "ioport.h" // outb
-#include "pic.h" // eoi_pic2
-#include "biosvar.h" // struct bios_data_area_s
 #include "bregs.h" // struct bregs
-#include "acpi.h" // find_resume_vector
-#include "ps2port.h" // i8042_reboot
-#include "pci.h" // pci_reboot
-#include "cmos.h" // inb_cmos
+#include "config.h" // CONFIG_*
+#include "farptr.h" // FLATPTR_TO_SEGOFF
+#include "hw/pci.h" // pci_reboot
+#include "hw/pic.h" // pic_eoi2
+#include "hw/ps2port.h" // i8042_reboot
+#include "hw/rtc.h" // rtc_read
+#include "output.h" // dprintf
+#include "stacks.h" // farcall16big
+#include "std/bda.h" // struct bios_data_area_s
+#include "string.h" // memset
+#include "util.h" // dma_setup
 
 // Indicator if POST phase has been run.
-int HaveRunPost VAR16VISIBLE;
-
-// Reset DMA controller
-void
-init_dma(void)
-{
-    // first reset the DMA controllers
-    outb(0, PORT_DMA1_MASTER_CLEAR);
-    outb(0, PORT_DMA2_MASTER_CLEAR);
-
-    // then initialize the DMA controllers
-    outb(0xc0, PORT_DMA2_MODE_REG);
-    outb(0x00, PORT_DMA2_MASK_REG);
-}
+int HaveRunPost VARFSEG;
 
 // Handler for post calls that look like a resume.
 void VISIBLE16
 handle_resume(void)
 {
     ASSERT16();
-    debug_setup();
-    int status = inb_cmos(CMOS_RESET_CODE);
-    outb_cmos(0, CMOS_RESET_CODE);
+    int status = rtc_read(CMOS_RESET_CODE);
+    rtc_write(CMOS_RESET_CODE, 0);
     dprintf(1, "In resume (status=%d)\n", status);
 
-    init_dma();
+    dma_setup();
 
     switch (status) {
     case 0x01 ... 0x04:
@@ -49,7 +38,7 @@ handle_resume(void)
 
     case 0x05:
         // flush keyboard (issue EOI) and jump via 40h:0067h
-        eoi_pic2();
+        pic_eoi2();
         // NO BREAK
     case 0x0a:
 #define BDA_JUMP (((struct bios_data_area_s *)0)->jump)
@@ -109,9 +98,11 @@ s3_resume(void)
     }
 
     pic_setup();
-    smm_init();
+    smm_setup();
 
-    s3_resume_vga_init();
+    pci_resume();
+
+    s3_resume_vga();
 
     make_bios_readonly();
 
@@ -120,21 +111,29 @@ s3_resume(void)
     memset(&br, 0, sizeof(br));
     dprintf(1, "Jump to resume vector (%x)\n", s3_resume_vector);
     br.code = FLATPTR_TO_SEGOFF((void*)s3_resume_vector);
-    call16big(&br);
+    farcall16big(&br);
 }
+
+u8 HaveAttemptedReboot VARLOW;
 
 // Attempt to invoke a hard-reboot.
 static void
 tryReboot(void)
 {
+    if (HaveAttemptedReboot) {
+        // Hard reboot has failed - try to shutdown machine.
+        dprintf(1, "Unable to hard-reboot machine - attempting shutdown.\n");
+        apm_shutdown();
+    }
+    HaveAttemptedReboot = 1;
+
     dprintf(1, "Attempting a hard reboot\n");
 
     // Setup for reset on qemu.
-    if (! CONFIG_COREBOOT) {
-        qemu_prep_reset();
-        if (HaveRunPost)
-            apm_shutdown();
-    }
+    qemu_prep_reset();
+
+    // Reboot using ACPI RESET_REG
+    acpi_reboot();
 
     // Try keyboard controller reboot.
     i8042_reboot();

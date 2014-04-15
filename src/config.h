@@ -5,29 +5,27 @@
 
 // Configuration definitions.
 
-//#define CONFIG_APPNAME  "QEMU"
-//#define CONFIG_CPUNAME8 "QEMUCPU "
-//#define CONFIG_APPNAME6 "QEMU  "
-//#define CONFIG_APPNAME4 "QEMU"
-#define CONFIG_APPNAME  "coreboot 4.0/ChromeOS"
-#define CONFIG_CPUNAME8 "BOCHSCPU"
-#define CONFIG_APPNAME6 "BOCHS "
-#define CONFIG_APPNAME4 "BXPC"
+//#define BUILD_APPNAME  "QEMU"
+//#define BUILD_CPUNAME8 "QEMUCPU "
+//#define BUILD_APPNAME6 "QEMU  "
+//#define BUILD_APPNAME4 "QEMU"
+#define BUILD_APPNAME  "Bochs"
+#define BUILD_CPUNAME8 "BOCHSCPU"
+#define BUILD_APPNAME6 "BOCHS "
+#define BUILD_APPNAME4 "BXPC"
 
 // Maximum number of map entries in the e820 map
-#define CONFIG_MAX_E820 32
-// Space to reserve in f-segment for dynamic allocations
-#define CONFIG_MAX_BIOSTABLE 2048
+#define BUILD_MAX_E820 32
 // Space to reserve in high-memory for tables
-#define CONFIG_MAX_HIGHTABLE (64*1024)
+#define BUILD_MAX_HIGHTABLE (256*1024)
 // Largest supported externaly facing drive id
-#define CONFIG_MAX_EXTDRIVE 16
+#define BUILD_MAX_EXTDRIVE 16
 // Number of bytes the smbios may be and still live in the f-segment
 #define BUILD_MAX_SMBIOS_FSEG     600
 
-#define CONFIG_MODEL_ID      0xFC
-#define CONFIG_SUBMODEL_ID   0x00
-#define CONFIG_BIOS_REVISION 0x01
+#define BUILD_MODEL_ID      0xFC
+#define BUILD_SUBMODEL_ID   0x00
+#define BUILD_BIOS_REVISION 0x01
 
 // Various memory addresses used by the code.
 #define BUILD_STACK_ADDR          0x7000
@@ -38,12 +36,12 @@
 #define BUILD_ROM_START           0xc0000
 #define BUILD_BIOS_ADDR           0xf0000
 #define BUILD_BIOS_SIZE           0x10000
+#define BUILD_EXTRA_STACK_SIZE    0x800
 // 32KB for shadow ram copying (works around emulator deficiencies)
 #define BUILD_BIOS_TMP_ADDR       0x30000
 #define BUILD_SMM_INIT_ADDR       0x38000
 #define BUILD_SMM_ADDR            0xa8000
 #define BUILD_SMM_SIZE            0x8000
-#define BUILD_MAX_HIGHMEM         0xe0000000
 
 #define BUILD_PCIMEM_START        0xe0000000
 #define BUILD_PCIMEM_END          0xfec00000    /* IOAPIC is mapped at */
@@ -51,8 +49,12 @@
 #define BUILD_PCIMEM64_END        0x10000000000ULL
 
 #define BUILD_IOAPIC_ADDR         0xfec00000
+#define BUILD_IOAPIC_ID           0
 #define BUILD_HPET_ADDRESS        0xfed00000
 #define BUILD_APIC_ADDR           0xfee00000
+
+// PCI IRQS
+#define BUILD_PCI_IRQS	        ((1<<5) | (1<<9) | (1<<10) | (1<<11))
 
 // Important real-mode segments
 #define SEG_IVT      0x0000
@@ -95,7 +97,7 @@
 #define DEBUG_ISR_hwpic2 5
 #define DEBUG_HDL_pnp 1
 #define DEBUG_HDL_pmm 1
-#define DEBUG_HDL_pcibios32 9
+#define DEBUG_HDL_pcibios 9
 #define DEBUG_HDL_apm 9
 
 #define DEBUG_unimplemented 2

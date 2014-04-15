@@ -5,12 +5,14 @@
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
-#include "types.h" // u32
-#include "util.h" // handle_1ab1
-#include "pci.h" // pci_config_readl
+#include "biosvar.h" // GET_GLOBAL
 #include "bregs.h" // struct bregs
-#include "biosvar.h" // GET_EBDA
-#include "pci_regs.h" // PCI_VENDOR_ID
+#include "hw/pci.h" // pci_config_readl
+#include "hw/pci_regs.h" // PCI_VENDOR_ID
+#include "output.h" // dprintf
+#include "std/pirtable.h" // struct pir_header
+#include "string.h" // checksum
+#include "util.h" // handle_1ab1
 
 // romlayout.S
 extern void entry_bios32(void);
@@ -133,11 +135,12 @@ handle_1ab10d(struct bregs *regs)
 static void
 handle_1ab10e(struct bregs *regs)
 {
-    struct pir_header *pirtable_g = (void*)(GET_GLOBAL(PirOffset) + 0);
-    if (! pirtable_g) {
+    struct pir_header *pirtable_gf = GET_GLOBAL(PirAddr);
+    if (! pirtable_gf) {
         set_code_invalid(regs, RET_FUNC_NOT_SUPPORTED);
         return;
     }
+    struct pir_header *pirtable_g = GLOBALFLAT2GLOBAL(pirtable_gf);
 
     struct param_s {
         u16 size;
@@ -200,18 +203,18 @@ handle_1ab1(struct bregs *regs)
     }
 }
 
+// Entry point for pci bios functions.
+void VISIBLE16 VISIBLE32SEG
+handle_pcibios(struct bregs *regs)
+{
+    debug_enter(regs, DEBUG_HDL_pcibios);
+    handle_1ab1(regs);
+}
+
 
 /****************************************************************
  * 32bit interface
  ****************************************************************/
-
-// Entry point for 32bit pci bios functions.
-void VISIBLE32SEG
-handle_pcibios32(struct bregs *regs)
-{
-    debug_enter(regs, DEBUG_HDL_pcibios32);
-    handle_1ab1(regs);
-}
 
 struct bios32_s {
     u32 signature;
@@ -222,13 +225,13 @@ struct bios32_s {
     u8 reserved[5];
 } PACKED;
 
-struct bios32_s BIOS32HEADER __aligned(16) VAR16EXPORT = {
+struct bios32_s BIOS32HEADER __aligned(16) VARFSEG = {
     .signature = 0x5f32335f, // _32_
     .length = sizeof(BIOS32HEADER) / 16,
 };
 
 void
-bios32_setup(void)
+bios32_init(void)
 {
     dprintf(3, "init bios32\n");
 
