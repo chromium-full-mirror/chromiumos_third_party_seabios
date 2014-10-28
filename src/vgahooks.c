@@ -4,22 +4,21 @@
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
-#include "bregs.h" // set_code_invalid
 #include "biosvar.h" // GET_GLOBAL
-#include "pci.h" // pci_find_device
-#include "pci_regs.h" // PCI_VENDOR_ID
-#include "pci_ids.h" // PCI_VENDOR_ID_VIA
-#include "util.h" // handle_155f
+#include "bregs.h" // set_code_invalid
 #include "config.h" // CONFIG_*
+#include "hw/pci.h" // pci_find_device
+#include "hw/pci_ids.h" // PCI_VENDOR_ID_VIA
+#include "hw/pci_regs.h" // PCI_VENDOR_ID
+#include "output.h" // dprintf
+#include "string.h" // strcmp
+#include "util.h" // handle_155f, handle_157f
 
 #define VH_VIA 1
 #define VH_INTEL 2
-#define VH_ALEX 3
-#define VH_STUMPY 4
-#define VH_LUMPY 5
-#define VH_LINK 6
+#define VH_SMI 3
 
-int VGAHookHandlerType VAR16VISIBLE;
+int VGAHookHandlerType VARFSEG;
 
 static void
 handle_155fXX(struct bregs *regs)
@@ -27,12 +26,17 @@ handle_155fXX(struct bregs *regs)
     set_code_unimplemented(regs, RET_EUNSUPPORTED);
 }
 
+static void
+handle_157fXX(struct bregs *regs)
+{
+    set_code_unimplemented(regs, RET_EUNSUPPORTED);
+}
 
 /****************************************************************
  * Via hooks
  ****************************************************************/
 
-int ViaFBsize VAR16VISIBLE, ViaRamSpeed VAR16VISIBLE;
+int ViaFBsize VARFSEG, ViaRamSpeed VARFSEG;
 
 static void
 via_155f01(struct bregs *regs)
@@ -171,7 +175,7 @@ via_setup(struct pci_device *pci)
  * Intel VGA hooks
  ****************************************************************/
 
-u8 IntelDisplayType VAR16VISIBLE, IntelDisplayId VAR16VISIBLE;
+u8 IntelDisplayType VARFSEG, IntelDisplayId VARFSEG;
 
 static void
 intel_155f35(struct bregs *regs)
@@ -250,300 +254,45 @@ getac_setup(struct pci_device *pci)
 {
 }
 
+/****************************************************************
+ * Silicon Motion hooks
+ ****************************************************************/
+
+u8 SmiBootDisplay VARFSEG; // 1: LCD, 2: CRT, 3: Both */
+
 static void
-alex_155f(struct bregs *regs)
+smi_157f02(struct bregs *regs)
 {
-    dprintf(1, "Executing Alex specific interrupt %02x.\n", regs->al);
+    /* Boot Display Device Override */
+    regs->ax = 0x007f;
+    regs->bl = GET_GLOBAL(SmiBootDisplay);
+    set_success(regs);
+}
+
+static void
+smi_157f14(struct bregs *regs)
+{
+    /* ReduceOn support default status */
+    regs->ax = 0x007f;
+    regs->bl = 0x00;
+    set_success(regs);
+}
+
+static void
+smi_157f(struct bregs *regs)
+{
     switch (regs->al) {
-    case 0x21:
-    case 0x22:
-        regs->ax = 0x005f;
-        set_success(regs);
-        break;
-    default:   handle_155fXX(regs); break;
+    case 0x02: smi_157f02(regs); break;
+    case 0x14: smi_157f14(regs); break;
+    default:   handle_157fXX(regs); break;
     }
 }
 
 static void
-alex_setup(struct pci_device *pci)
+winent_mb6047_setup(struct pci_device *pci)
 {
-    VGAHookHandlerType = VH_ALEX;
-}
-
-static void
-stumpy_155f(struct bregs *regs)
-{
-    dprintf(1, "Executing Stumpy VGA hooks interrupt %02x.\n", regs->al);
-    switch (regs->al) {
-    case 0x34:
-        /*
-         * Set Panel Fitting Hook:
-         *  bit 2 = Graphics Stretching
-         *  bit 1 = Text Stretching
-         *  bit 0 = Centering (do not set with bit1 or bit2)
-         *  0     = video bios default
-         */
-        regs->eax &= 0xffff0000;
-        regs->eax |= 0x005f;
-        regs->ecx &= 0xffffff00;
-        regs->ecx |= 0x00;
-        set_success(regs);
-        break;
-    case 0x35:
-        /*
-         * Boot Display Device Hook:
-         *  bit 0 = CRT
-         *  bit 1 = TV
-         *  bit 2 = EFP *
-         *  bit 3 = LFP
-         *  bit 4 = CRT2
-         *  bit 5 = TV2
-         *  bit 6 = EFP2 *
-         *  bit 7 = LFP2
-         */
-        regs->eax &= 0xffff0000;
-        regs->eax |= 0x005f;
-        regs->ecx &= 0xffff0000;
-        set_success(regs);
-        break;
-    case 0x51:
-        /*
-         * Hook to select active LFP configuration:
-         *  00h = No LVDS, VBIOS does not enable LVDS
-         *  01h = Int-LVDS, LFP driven by integrated LVDS decoder
-         *  02h = SVDO-LVDS, LFP driven by SVDO decoder
-         *  03h = eDP, LFP Driven by Int-DisplayPort encoder
-         */
-        regs->eax &= 0xffff0000;
-        regs->eax |= 0x005f;
-        regs->ecx &= 0xffff0000;
-        regs->ecx |= 0x0003;
-        set_success(regs);
-        break;
-    case 0x70:
-        switch ((regs->ecx >> 8) & 0xff) {
-        case 0:
-            /* Get Mux */
-            regs->eax &= 0xffff0000;
-            regs->eax |= 0x005f;
-            regs->ecx &= 0xffff0000;
-            regs->ecx |= 0x0000;
-            set_success(regs);
-            break;
-        case 1:
-            /* Set Mux */
-            regs->eax &= 0xffff0000;
-            regs->eax |= 0x005f;
-            regs->ecx &= 0xffff0000;
-            regs->ecx |= 0x0000;
-            set_success(regs);
-            break;
-        case 2:
-            /* Get SG/Non-SG mode */
-            regs->eax &= 0xffff0000;
-            regs->eax |= 0x005f;
-            regs->ecx &= 0xffff0000;
-            regs->ecx |= 0x0000;
-            set_success(regs);
-            break;
-        default:
-            /* Interrupt was not handled */
-            handle_155fXX(regs);
-            break;
-        }
-        break;
-    default: handle_155fXX(regs); break;
-    }
-}
-
-static void
-stumpy_setup(struct pci_device *pci)
-{
-    VGAHookHandlerType = VH_STUMPY;
-}
-
-static void
-lumpy_155f(struct bregs *regs)
-{
-    dprintf(1, "Executing Stumpy VGA hooks interrupt %02x.\n", regs->al);
-    switch (regs->al) {
-    case 0x34:
-        /*
-         * Set Panel Fitting Hook:
-         *  bit 2 = Graphics Stretching
-         *  bit 1 = Text Stretching
-         *  bit 0 = Centering (do not set with bit1 or bit2)
-         *  0     = video bios default
-         */
-        regs->eax &= 0xffff0000;
-        regs->eax |= 0x005f;
-        regs->ecx &= 0xffffff00;
-        regs->ecx |= 0x00;
-        set_success(regs);
-        break;
-    case 0x35:
-        /*
-         * Boot Display Device Hook:
-         *  bit 0 = CRT
-         *  bit 1 = TV
-         *  bit 2 = EFP *
-         *  bit 3 = LFP
-         *  bit 4 = CRT2
-         *  bit 5 = TV2
-         *  bit 6 = EFP2 *
-         *  bit 7 = LFP2
-         */
-        regs->eax &= 0xffff0000;
-        regs->eax |= 0x005f;
-        regs->ecx &= 0xffff0000;
-        set_success(regs);
-        break;
-    case 0x51:
-        /*
-         * Hook to select active LFP configuration:
-         *  00h = No LVDS, VBIOS does not enable LVDS
-         *  01h = Int-LVDS, LFP driven by integrated LVDS decoder
-         *  02h = SVDO-LVDS, LFP driven by SVDO decoder
-         *  03h = eDP, LFP Driven by Int-DisplayPort encoder
-         */
-        regs->eax &= 0xffff0000;
-        regs->eax |= 0x005f;
-        regs->ecx &= 0xffff0000;
-        regs->ecx |= 0x0001;
-        set_success(regs);
-        break;
-    case 0x70:
-        switch ((regs->ecx >> 8) & 0xff) {
-        case 0:
-            /* Get Mux */
-            regs->eax &= 0xffff0000;
-            regs->eax |= 0x005f;
-            regs->ecx &= 0xffff0000;
-            regs->ecx |= 0x0000;
-            set_success(regs);
-            break;
-        case 1:
-            /* Set Mux */
-            regs->eax &= 0xffff0000;
-            regs->eax |= 0x005f;
-            regs->ecx &= 0xffff0000;
-            regs->ecx |= 0x0000;
-            set_success(regs);
-            break;
-        case 2:
-            /* Get SG/Non-SG mode */
-            regs->eax &= 0xffff0000;
-            regs->eax |= 0x005f;
-            regs->ecx &= 0xffff0000;
-            regs->ecx |= 0x0000;
-            set_success(regs);
-            break;
-        default:
-            /* Interrupt was not handled */
-            handle_155fXX(regs);
-            break;
-        }
-        break;
-    default: handle_155fXX(regs); break;
-    }
-}
-
-static void
-link_155f(struct bregs *regs)
-{
-    dprintf(1, "Executing Link VGA hooks interrupt %02x.\n", regs->al);
-    switch (regs->al) {
-    case 0x34:
-        /*
-         * Set Panel Fitting Hook:
-         *  bit 2 = Graphics Stretching
-         *  bit 1 = Text Stretching
-         *  bit 0 = Centering (do not set with bit1 or bit2)
-         *  0     = video bios default
-         */
-        regs->eax &= 0xffff0000;
-        regs->eax |= 0x005f;
-        regs->ecx &= 0xffffff00;
-        regs->ecx |= 0x00;
-        set_success(regs);
-        break;
-    case 0x35:
-        /*
-         * Boot Display Device Hook:
-         *  bit 0 = CRT
-         *  bit 1 = TV
-         *  bit 2 = EFP *
-         *  bit 3 = LFP
-         *  bit 4 = CRT2
-         *  bit 5 = TV2
-         *  bit 6 = EFP2 *
-         *  bit 7 = LFP2
-         */
-        regs->eax &= 0xffff0000;
-        regs->eax |= 0x005f;
-        regs->ecx &= 0xffff0000;
-        set_success(regs);
-        break;
-    case 0x51:
-        /*
-         * Hook to select active LFP configuration:
-         *  00h = No LVDS, VBIOS does not enable LVDS
-         *  01h = Int-LVDS, LFP driven by integrated LVDS decoder
-         *  02h = SVDO-LVDS, LFP driven by SVDO decoder
-         *  03h = eDP, LFP Driven by Int-DisplayPort encoder
-         */
-        regs->eax &= 0xffff0000;
-        regs->eax |= 0x005f;
-        regs->ecx &= 0xffff0000;
-        regs->ecx |= 0x0003;
-        set_success(regs);
-        break;
-    case 0x70:
-        switch ((regs->ecx >> 8) & 0xff) {
-        case 0:
-            /* Get Mux */
-            regs->eax &= 0xffff0000;
-            regs->eax |= 0x005f;
-            regs->ecx &= 0xffff0000;
-            regs->ecx |= 0x0000;
-            set_success(regs);
-            break;
-        case 1:
-            /* Set Mux */
-            regs->eax &= 0xffff0000;
-            regs->eax |= 0x005f;
-            regs->ecx &= 0xffff0000;
-            regs->ecx |= 0x0000;
-            set_success(regs);
-            break;
-        case 2:
-            /* Get SG/Non-SG mode */
-            regs->eax &= 0xffff0000;
-            regs->eax |= 0x005f;
-            regs->ecx &= 0xffff0000;
-            regs->ecx |= 0x0000;
-            set_success(regs);
-            break;
-        default:
-            /* Interrupt was not handled */
-            handle_155fXX(regs);
-            break;
-        }
-        break;
-    default: handle_155fXX(regs); break;
-    }
-}
-
-static void
-lumpy_setup(struct pci_device *pci)
-{
-    VGAHookHandlerType = VH_LUMPY;
-}
-
-static void
-link_setup(struct pci_device *pci)
-{
-	VGAHookHandlerType = VH_LINK;
+    VGAHookHandlerType = VH_SMI;
+    SmiBootDisplay = 0x02;
 }
 
 /****************************************************************
@@ -561,13 +310,25 @@ handle_155f(struct bregs *regs)
 
     int htype = GET_GLOBAL(VGAHookHandlerType);
     switch (htype) {
-    case VH_VIA:    via_155f(regs); break;
-    case VH_INTEL:  intel_155f(regs); break;
-    case VH_ALEX:   alex_155f(regs); break;
-    case VH_STUMPY: stumpy_155f(regs); break;
-    case VH_LUMPY:  lumpy_155f(regs); break;
-    case VH_LINK:   link_155f(regs); break;
-    default:        handle_155fXX(regs); break;
+    case VH_VIA:   via_155f(regs); break;
+    case VH_INTEL: intel_155f(regs); break;
+    default:       handle_155fXX(regs); break;
+    }
+}
+
+// Main 16bit entry point
+void
+handle_157f(struct bregs *regs)
+{
+    if (!CONFIG_VGAHOOKS) {
+        handle_157fXX(regs);
+        return;
+    }
+
+    int htype = GET_GLOBAL(VGAHookHandlerType);
+    switch (htype) {
+    case VH_SMI:   smi_157f(regs); break;
+    default:       handle_157fXX(regs); break;
     }
 }
 
@@ -584,14 +345,8 @@ vgahook_setup(struct pci_device *pci)
         getac_setup(pci);
     else if (strcmp(CBvendor, "RODA") == 0 && strcmp(CBpart, "RK886EX") == 0)
         roda_setup(pci);
-    else if (strcmp(CBvendor, "SAMSUNG") == 0 && strcmp(CBpart, "Alex") == 0)
-        alex_setup(pci);
-    else if (strcmp(CBvendor, "SAMSUNG") == 0 && strcmp(CBpart, "Stumpy") == 0)
-        stumpy_setup(pci);
-    else if (strcmp(CBvendor, "SAMSUNG") == 0 && strcmp(CBpart, "Lumpy") == 0)
-        lumpy_setup(pci);
-    else if (strcmp(CBvendor, "GOOGLE") == 0 && strcmp(CBpart, "Link") == 0)
-	    link_setup(pci);
+    else if (strcmp(CBvendor, "Win Enterprise") == 0 && strcmp(CBpart, "MB6047") == 0)
+        winent_mb6047_setup(pci);
     else if (pci->vendor == PCI_VENDOR_ID_VIA)
         via_setup(pci);
     else if (pci->vendor == PCI_VENDOR_ID_INTEL)

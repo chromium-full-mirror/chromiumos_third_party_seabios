@@ -6,28 +6,29 @@
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include "biosvar.h" // GET_EBDA
-#include "util.h" // debug_isr
-#include "pic.h" // eoi_pic2
 #include "bregs.h" // struct bregs
-#include "ps2port.h" // ps2_mouse_command
-#include "usb-hid.h" // usb_mouse_command
+#include "hw/ps2port.h" // ps2_mouse_command
+#include "hw/usb-hid.h" // usb_mouse_command
+#include "output.h" // dprintf
+#include "stacks.h" // stack_hop
+#include "util.h" // mouse_init
 
 void
-mouse_setup(void)
+mouse_init(void)
 {
     if (! CONFIG_MOUSE)
         return;
     dprintf(3, "init mouse\n");
     // pointing device installed
-    SETBITS_BDA(equipment_list_flags, 0x04);
+    set_equipment_flags(0x04, 0x04);
 }
 
-static inline int
+static int
 mouse_command(int command, u8 *param)
 {
     if (usb_mouse_active())
-        return usb_mouse_command(command, param);
-    return ps2_mouse_command(command, param);
+        return stack_hop(command, (u32)param, usb_mouse_command);
+    return stack_hop(command, (u32)param, ps2_mouse_command);
 }
 
 #define RET_SUCCESS      0x00
@@ -52,7 +53,8 @@ mouse_15c20000(struct bregs *regs)
 static void
 mouse_15c20001(struct bregs *regs)
 {
-    u8 mouse_flags_2 = GET_EBDA(mouse_flag2);
+    u16 ebda_seg = get_ebda_seg();
+    u8 mouse_flags_2 = GET_EBDA(ebda_seg, mouse_flag2);
     if ((mouse_flags_2 & 0x80) == 0) {
         set_code_invalid(regs, RET_ENOHANDLER);
         return;
@@ -158,8 +160,8 @@ mouse_15c205(struct bregs *regs)
         return;
     }
     u16 ebda_seg = get_ebda_seg();
-    SET_EBDA2(ebda_seg, mouse_flag1, 0x00);
-    SET_EBDA2(ebda_seg, mouse_flag2, regs->bh);
+    SET_EBDA(ebda_seg, mouse_flag1, 0x00);
+    SET_EBDA(ebda_seg, mouse_flag2, regs->bh);
 
     // Reset Mouse
     mouse_15c201(regs);
@@ -227,7 +229,7 @@ mouse_15c207(struct bregs *regs)
 {
     struct segoff_s farptr = SEGOFF(regs->es, regs->bx);
     u16 ebda_seg = get_ebda_seg();
-    u8 mouse_flags_2 = GET_EBDA2(ebda_seg, mouse_flag2);
+    u8 mouse_flags_2 = GET_EBDA(ebda_seg, mouse_flag2);
     if (! farptr.segoff) {
         /* remove handler */
         if ((mouse_flags_2 & 0x80) != 0) {
@@ -238,8 +240,8 @@ mouse_15c207(struct bregs *regs)
         /* install handler */
         mouse_flags_2 |= 0x80;
     }
-    SET_EBDA2(ebda_seg, mouse_flag2, mouse_flags_2);
-    SET_EBDA2(ebda_seg, far_call_pointer, farptr);
+    SET_EBDA(ebda_seg, mouse_flag2, mouse_flags_2);
+    SET_EBDA(ebda_seg, far_call_pointer, farptr);
     set_code_success(regs);
 }
 
@@ -272,36 +274,14 @@ handle_15c2(struct bregs *regs)
     }
 }
 
-void noinline
-process_mouse(u8 data)
+static void
+invoke_mouse_handler(u16 ebda_seg)
 {
-    if (!CONFIG_MOUSE)
-        return;
+    u16 status = GET_EBDA(ebda_seg, mouse_data[0]);
+    u16 X      = GET_EBDA(ebda_seg, mouse_data[1]);
+    u16 Y      = GET_EBDA(ebda_seg, mouse_data[2]);
 
-    u16 ebda_seg = get_ebda_seg();
-    u8 mouse_flags_1 = GET_EBDA2(ebda_seg, mouse_flag1);
-    u8 mouse_flags_2 = GET_EBDA2(ebda_seg, mouse_flag2);
-
-    if (! (mouse_flags_2 & 0x80))
-        // far call handler not installed
-        return;
-
-    u8 package_count = mouse_flags_2 & 0x07;
-    u8 index = mouse_flags_1 & 0x07;
-    SET_EBDA2(ebda_seg, mouse_data[index], data);
-
-    if ((index+1) < package_count) {
-        mouse_flags_1++;
-        SET_EBDA2(ebda_seg, mouse_flag1, mouse_flags_1);
-        return;
-    }
-
-    u16 status = GET_EBDA2(ebda_seg, mouse_data[0]);
-    u16 X      = GET_EBDA2(ebda_seg, mouse_data[1]);
-    u16 Y      = GET_EBDA2(ebda_seg, mouse_data[2]);
-    SET_EBDA2(ebda_seg, mouse_flag1, 0);
-
-    struct segoff_s func = GET_EBDA2(ebda_seg, far_call_pointer);
+    struct segoff_s func = GET_EBDA(ebda_seg, far_call_pointer);
     dprintf(16, "mouse farcall s=%04x x=%04x y=%04x func=%04x:%04x\n"
             , status, X, Y, func.seg, func.offset);
 
@@ -323,4 +303,32 @@ process_mouse(u8 data)
         : "+a"(func.segoff), "+c"(status), "+d"(X), "+b"(Y)
         :
         : "edi", "esi", "cc", "memory");
+}
+
+void
+process_mouse(u8 data)
+{
+    if (!CONFIG_MOUSE)
+        return;
+
+    u16 ebda_seg = get_ebda_seg();
+    u8 mouse_flags_1 = GET_EBDA(ebda_seg, mouse_flag1);
+    u8 mouse_flags_2 = GET_EBDA(ebda_seg, mouse_flag2);
+
+    if (! (mouse_flags_2 & 0x80))
+        // far call handler not installed
+        return;
+
+    u8 package_count = mouse_flags_2 & 0x07;
+    u8 index = mouse_flags_1 & 0x07;
+    SET_EBDA(ebda_seg, mouse_data[index], data);
+
+    if ((index+1) < package_count) {
+        mouse_flags_1++;
+        SET_EBDA(ebda_seg, mouse_flag1, mouse_flags_1);
+        return;
+    }
+
+    SET_EBDA(ebda_seg, mouse_flag1, 0);
+    stack_hop_back(ebda_seg, 0, invoke_mouse_handler);
 }

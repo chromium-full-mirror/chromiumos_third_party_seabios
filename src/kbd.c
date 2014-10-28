@@ -6,11 +6,14 @@
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include "biosvar.h" // GET_BDA
-#include "util.h" // debug_enter
-#include "config.h" // CONFIG_*
 #include "bregs.h" // struct bregs
-#include "ps2port.h" // ps2_kbd_command
-#include "usb-hid.h" // usb_kbd_command
+#include "config.h" // CONFIG_*
+#include "hw/ps2port.h" // ps2_kbd_command
+#include "hw/usb-hid.h" // usb_kbd_command
+#include "output.h" // debug_enter
+#include "stacks.h" // stack_hop
+#include "string.h" // memset
+#include "util.h" // kbd_init
 
 // Bit definitions for BDA kbd_flag[012]
 #define KF0_RSHIFT       (1<<0)
@@ -35,7 +38,7 @@
 #define KF2_101KBD     (1<<4)
 
 void
-kbd_setup(void)
+kbd_init(void)
 {
     dprintf(3, "init keyboard\n");
     u16 x = offsetof(struct bios_data_area_s, kbd_buf);
@@ -87,7 +90,7 @@ dequeue_key(struct bregs *regs, int incr, int extended)
             regs->flags |= F_ZF;
             return;
         }
-        wait_irq();
+        yield_toirq();
     }
 
     u8 ascii_code = GET_FARVAR(SEG_BDA, *(u8*)(buffer_head+0));
@@ -110,12 +113,12 @@ dequeue_key(struct bregs *regs, int incr, int extended)
     SET_BDA(kbd_buf_head, buffer_head);
 }
 
-static inline int
+static int
 kbd_command(int command, u8 *param)
 {
     if (usb_kbd_active())
-        return usb_kbd_command(command, param);
-    return ps2_kbd_command(command, param);
+        return stack_hop(command, (u32)param, usb_kbd_command);
+    return stack_hop(command, (u32)param, ps2_kbd_command);
 }
 
 // read keyboard input
@@ -165,7 +168,7 @@ handle_1609(struct bregs *regs)
 }
 
 // GET KEYBOARD ID
-static void
+static void noinline
 handle_160a(struct bregs *regs)
 {
     u8 param[2];
@@ -231,7 +234,7 @@ handle_16XX(struct bregs *regs)
     warn_unimplemented(regs);
 }
 
-static void
+static void noinline
 set_leds(void)
 {
     u8 shift_flags = (GET_BDA(kbd_flag0) >> 4) & 0x07;
@@ -258,6 +261,18 @@ handle_16(struct bregs *regs)
 
     // XXX - set_leds should be called from irq handler
     set_leds();
+
+    // If interrupts are not enabled do KBC polling.
+    // Check the KBC for a key on every keyboard service function (INT16).
+    // If interrupts are working the KBC status port should always be empty.
+    // (Yes, there is a race condition, but it is recoverable).
+    if (CONFIG_PS2PORT && CONFIG_KBC_POLL) {
+        u8 v = inb(PORT_PS2_STATUS);
+        if ((v & I8042_STR_OBF) && !(v & I8042_STR_AUXDATA)) {
+            v = inb(PORT_PS2_DATA);
+            process_key(v);
+        }
+    }
 
     switch (regs->ah) {
     case 0x00: handle_1600(regs); break;
@@ -378,10 +393,8 @@ static struct scaninfo {
     { 0x8600, 0x8800, 0x8a00, 0x8c00, none }, /* F12 */
 };
 
-// Handle a scancode read from the ps2 port.  Note that "noinline" is
-// used to make sure the call to call16_simpint in process_key doesn't
-// have the overhead of this function's stack.
-static void noinline
+// Handle a ps2 style scancode read from the keyboard.
+static void
 __process_key(u8 scancode)
 {
     u8 flags0 = GET_BDA(kbd_flag0);
@@ -562,12 +575,14 @@ process_key(u8 key)
 
     if (CONFIG_KBD_CALL_INT15_4F) {
         // allow for keyboard intercept
-        u32 eax = (0x4f << 8) | key;
-        u32 flags;
-        call16_simpint(0x15, &eax, &flags);
-        if (!(flags & F_CF))
+        struct bregs br;
+        memset(&br, 0, sizeof(br));
+        br.eax = (0x4f << 8) | key;
+        br.flags = F_IF|F_CF;
+        call16_int(0x15, &br);
+        if (!(br.flags & F_CF))
             return;
-        key = eax;
+        key = br.eax;
     }
     __process_key(key);
 }

@@ -6,18 +6,19 @@
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
-#include "vgabios.h" // handle_104f
-#include "config.h" // CONFIG_*
-#include "bregs.h" // struct bregs
-#include "vbe.h" // struct vbe_info
-#include "util.h" // dprintf
 #include "biosvar.h" // GET_GLOBAL
+#include "bregs.h" // struct bregs
+#include "config.h" // CONFIG_*
+#include "output.h" // dprintf
+#include "std/vbe.h" // struct vbe_info
+#include "string.h" // memset_far
+#include "vgabios.h" // handle_104f
 #include "vgahw.h" // vgahw_set_mode
 
 u32 VBE_total_memory VAR16 = 256 * 1024;
 u32 VBE_capabilities VAR16;
 u32 VBE_framebuffer VAR16;
-u16 VBE_win_granularity VAR16 = 64;
+u16 VBE_win_granularity VAR16;
 
 static void
 vbe_104f00(struct bregs *regs)
@@ -74,7 +75,7 @@ vbe_104f01(struct bregs *regs)
 
     dprintf(1, "VBE mode info request: %x\n", mode);
 
-    struct vgamode_s *vmode_g = vgahw_find_mode(mode);
+    struct vgamode_s *vmode_g = vgahw_find_mode(mode & ~MF_VBEFLAGS);
     if (! vmode_g) {
         dprintf(1, "VBE mode %x not found\n", mode);
         regs->ax = 0x014f;
@@ -82,27 +83,22 @@ vbe_104f01(struct bregs *regs)
     }
 
     memset_far(seg, info, 0, sizeof(*info));
-    u16 mode_attr = VBE_MODE_ATTRIBUTE_SUPPORTED |
-                    VBE_MODE_ATTRIBUTE_EXTENDED_INFORMATION_AVAILABLE |
-                    VBE_MODE_ATTRIBUTE_COLOR_MODE |
-                    VBE_MODE_ATTRIBUTE_GRAPHICS_MODE |
-                    VBE_MODE_ATTRIBUTE_NOT_VGA_COMPATIBLE;
-    u32 framebuffer = GET_GLOBAL(VBE_framebuffer);
-    if (framebuffer)
-        mode_attr |= VBE_MODE_ATTRIBUTE_LINEAR_FRAME_BUFFER_MODE;
-    SET_FARVAR(seg, info->mode_attributes, mode_attr);
+
+    // Basic information about video controller.
+    u32 win_granularity = GET_GLOBAL(VBE_win_granularity);
     SET_FARVAR(seg, info->winA_attributes,
-               VBE_WINDOW_ATTRIBUTE_RELOCATABLE |
+               (win_granularity ? VBE_WINDOW_ATTRIBUTE_RELOCATABLE : 0) |
                VBE_WINDOW_ATTRIBUTE_READABLE |
                VBE_WINDOW_ATTRIBUTE_WRITEABLE);
     SET_FARVAR(seg, info->winB_attributes, 0);
-    SET_FARVAR(seg, info->win_granularity, GET_GLOBAL(VBE_win_granularity));
+    SET_FARVAR(seg, info->win_granularity, win_granularity);
     SET_FARVAR(seg, info->win_size, 64); /* Bank size 64K */
     SET_FARVAR(seg, info->winA_seg, GET_GLOBAL(vmode_g->sstart));
     SET_FARVAR(seg, info->winB_seg, 0x0);
     extern void entry_104f05(void);
     SET_FARVAR(seg, info->win_func_ptr
                , SEGOFF(get_global_seg(), (u32)entry_104f05));
+    // Basic information about mode.
     int width = GET_GLOBAL(vmode_g->width);
     int height = GET_GLOBAL(vmode_g->height);
     int linesize = DIV_ROUND_UP(width * vga_bpp(vmode_g), 8);
@@ -112,18 +108,54 @@ vbe_104f01(struct bregs *regs)
     SET_FARVAR(seg, info->xcharsize, GET_GLOBAL(vmode_g->cwidth));
     SET_FARVAR(seg, info->ycharsize, GET_GLOBAL(vmode_g->cheight));
     int depth = GET_GLOBAL(vmode_g->depth);
-    int planes = (depth == 4) ? 4 : 1;
-    SET_FARVAR(seg, info->planes, planes);
     SET_FARVAR(seg, info->bits_per_pixel, depth);
-    SET_FARVAR(seg, info->banks, 1);
-    SET_FARVAR(seg, info->mem_model, GET_GLOBAL(vmode_g->memmodel));
-    SET_FARVAR(seg, info->bank_size, 0);
-    u32 pages = GET_GLOBAL(VBE_total_memory) / ALIGN(height * linesize, 64*1024);
-    SET_FARVAR(seg, info->pages, (pages / planes) - 1);
+    u8 memmodel = GET_GLOBAL(vmode_g->memmodel);
+    SET_FARVAR(seg, info->mem_model, memmodel);
     SET_FARVAR(seg, info->reserved0, 1);
 
-    u8 r_size, r_pos, g_size, g_pos, b_size, b_pos, a_size, a_pos;
+    // Mode specific info.
+    u16 mode_attr = VBE_MODE_ATTRIBUTE_SUPPORTED |
+                    VBE_MODE_ATTRIBUTE_EXTENDED_INFORMATION_AVAILABLE |
+                    VBE_MODE_ATTRIBUTE_COLOR_MODE |
+                    VBE_MODE_ATTRIBUTE_GRAPHICS_MODE |
+                    VBE_MODE_ATTRIBUTE_NOT_VGA_COMPATIBLE;
+    u32 framebuffer = 0;
+    int planes = 1, banks = 1;
+    u32 pages = GET_GLOBAL(VBE_total_memory) / ALIGN(height * linesize, 64*1024);
+    switch (memmodel) {
+    case MM_TEXT:
+        mode_attr &= ~VBE_MODE_ATTRIBUTE_GRAPHICS_MODE;
+        mode_attr |= VBE_MODE_ATTRIBUTE_TTY_BIOS_SUPPORT;
+        if (GET_GLOBAL(vmode_g->sstart) == SEG_MTEXT)
+            mode_attr &= ~VBE_MODE_ATTRIBUTE_COLOR_MODE;
+        pages = 1;
+        break;
+    case MM_CGA:
+        pages = 1;
+        banks = 2;
+        SET_FARVAR(seg, info->bank_size, 8);
+        break;
+    case MM_PLANAR:
+        planes = 4;
+        pages /= 4;
+        break;
+    default:
+        framebuffer = GET_GLOBAL(VBE_framebuffer);
+        if (framebuffer)
+            mode_attr |= VBE_MODE_ATTRIBUTE_LINEAR_FRAME_BUFFER_MODE;
+        break;
+    }
+    if (pages > 128)
+        pages = 128;
+    if (pages < 2)
+        pages++;
+    SET_FARVAR(seg, info->mode_attributes, mode_attr);
+    SET_FARVAR(seg, info->planes, planes);
+    SET_FARVAR(seg, info->pages, pages - 1);
+    SET_FARVAR(seg, info->banks, banks);
 
+    // Pixel color breakdown
+    u8 r_size, r_pos, g_size, g_pos, b_size, b_pos, a_size, a_pos;
     switch (depth) {
     case 15: r_size = 5; r_pos = 10; g_size = 5; g_pos = 5;
              b_size = 5; b_pos = 0; a_size = 1; a_pos = 15; break;
@@ -132,11 +164,13 @@ vbe_104f01(struct bregs *regs)
     case 24: r_size = 8; r_pos = 16; g_size = 8; g_pos = 8;
              b_size = 8; b_pos = 0; a_size = 0; a_pos = 0; break;
     case 32: r_size = 8; r_pos = 16; g_size = 8; g_pos = 8;
-             b_size = 8; b_pos = 0; a_size = 8; a_pos = 24; break;
+             b_size = 8; b_pos = 0; a_size = 8; a_pos = 24;
+             SET_FARVAR(seg, info->directcolor_info,
+                        VBE_DIRECTCOLOR_RESERVED_BITS_AVAILABLE);
+             break;
     default: r_size = 0; r_pos = 0; g_size = 0; g_pos = 0;
              b_size = 0; b_pos = 0; a_size = 0; a_pos = 0; break;
     }
-
     SET_FARVAR(seg, info->red_size, r_size);
     SET_FARVAR(seg, info->red_pos, r_pos);
     SET_FARVAR(seg, info->green_size, g_size);
@@ -146,31 +180,23 @@ vbe_104f01(struct bregs *regs)
     SET_FARVAR(seg, info->alpha_size, a_size);
     SET_FARVAR(seg, info->alpha_pos, a_pos);
 
-    if (depth == 32)
-        SET_FARVAR(seg, info->directcolor_info,
-                   VBE_DIRECTCOLOR_RESERVED_BITS_AVAILABLE);
-    else
-        SET_FARVAR(seg, info->directcolor_info, 0);
+    // Linear framebuffer info.
+    if (framebuffer) {
+        SET_FARVAR(seg, info->phys_base, framebuffer);
 
-    if (depth > 4)
-        SET_FARVAR(seg, info->phys_base, GET_GLOBAL(VBE_framebuffer));
-    else
-        SET_FARVAR(seg, info->phys_base, 0);
-
-    SET_FARVAR(seg, info->reserved1, 0);
-    SET_FARVAR(seg, info->reserved2, 0);
-    SET_FARVAR(seg, info->linear_bytes_per_scanline, linesize);
-    SET_FARVAR(seg, info->bank_pages, 0);
-    SET_FARVAR(seg, info->linear_pages, 0);
-    SET_FARVAR(seg, info->linear_red_size, r_size);
-    SET_FARVAR(seg, info->linear_red_pos, r_pos);
-    SET_FARVAR(seg, info->linear_green_size, g_size);
-    SET_FARVAR(seg, info->linear_green_pos, g_pos);
-    SET_FARVAR(seg, info->linear_blue_size, b_size);
-    SET_FARVAR(seg, info->linear_blue_pos, b_pos);
-    SET_FARVAR(seg, info->linear_alpha_size, a_size);
-    SET_FARVAR(seg, info->linear_alpha_pos, a_pos);
-    SET_FARVAR(seg, info->pixclock_max, 0);
+        SET_FARVAR(seg, info->reserved1, 0);
+        SET_FARVAR(seg, info->reserved2, 0);
+        SET_FARVAR(seg, info->linear_bytes_per_scanline, linesize);
+        SET_FARVAR(seg, info->linear_pages, 0);
+        SET_FARVAR(seg, info->linear_red_size, r_size);
+        SET_FARVAR(seg, info->linear_red_pos, r_pos);
+        SET_FARVAR(seg, info->linear_green_size, g_size);
+        SET_FARVAR(seg, info->linear_green_pos, g_pos);
+        SET_FARVAR(seg, info->linear_blue_size, b_size);
+        SET_FARVAR(seg, info->linear_blue_pos, b_pos);
+        SET_FARVAR(seg, info->linear_alpha_size, a_size);
+        SET_FARVAR(seg, info->linear_alpha_pos, a_pos);
+    }
 
     regs->ax = 0x004f;
 }

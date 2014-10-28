@@ -1,193 +1,35 @@
 // Raw screen writing and debug output code.
 //
-// Copyright (C) 2008,2009  Kevin O'Connor <kevin@koconnor.net>
+// Copyright (C) 2008-2013  Kevin O'Connor <kevin@koconnor.net>
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include <stdarg.h> // va_list
 
 #include "farptr.h" // GET_VAR
-#include "util.h" // printf
 #include "bregs.h" // struct bregs
 #include "config.h" // CONFIG_*
 #include "biosvar.h" // GET_GLOBAL
-#include "pci.h" // pci_find_device
+#include "hw/serialio.h" // serial_debug_putc
+#include "malloc.h" // malloc_tmp
+#include "output.h" // dprintf
+#include "stacks.h" // call16_int
+#include "string.h" // memset
+#include "util.h" // ScreenAndDebug
 
 struct putcinfo {
     void (*func)(struct putcinfo *info, char c);
 };
 
+
 /****************************************************************
  * Debug output
  ****************************************************************/
 
-#define DEBUG_TIMEOUT 100000
-
-#define OXPCIE_COM1 (GET_GLOBAL(oxpcie_bar) + 0x1000)
-u32 oxpcie_bar VAR16VISIBLE;
-
-static void
-debug_serial_setup(void)
-{
-    if (!CONFIG_DEBUG_SERIAL)
-        return;
-    // setup for serial logging: 8N1
-    u8 oldparam, newparam = 0x03;
-    oldparam = inb(CONFIG_DEBUG_SERIAL_PORT+SEROFF_LCR);
-    outb(newparam, CONFIG_DEBUG_SERIAL_PORT+SEROFF_LCR);
-    // Disable irqs
-    u8 oldier, newier = 0;
-    oldier = inb(CONFIG_DEBUG_SERIAL_PORT+SEROFF_IER);
-    outb(newier, CONFIG_DEBUG_SERIAL_PORT+SEROFF_IER);
-
-    if (oldparam != newparam || oldier != newier)
-        dprintf(1, "Changing serial settings was %x/%x now %x/%x\n"
-                , oldparam, oldier, newparam, newier);
-}
-
-// Write a character to the serial port.
-static void
-debug_serial(char c)
-{
-    if (!CONFIG_DEBUG_SERIAL)
-        return;
-    int timeout = DEBUG_TIMEOUT;
-    while ((inb(CONFIG_DEBUG_SERIAL_PORT+SEROFF_LSR) & 0x20) != 0x20)
-        if (!timeout--)
-            // Ran out of time.
-            return;
-    outb(c, CONFIG_DEBUG_SERIAL_PORT+SEROFF_DATA);
-}
-
-// Make sure all serial port writes have been completely sent.
-static void
-debug_serial_flush(void)
-{
-    if (!CONFIG_DEBUG_SERIAL)
-        return;
-    int timeout = DEBUG_TIMEOUT;
-    while ((inb(CONFIG_DEBUG_SERIAL_PORT+SEROFF_LSR) & 0x60) != 0x60)
-        if (!timeout--)
-            // Ran out of time.
-            return;
-}
-
-void   VISIBLE32FLAT
-debug_serial_oxford_setup_32(void)
-{
-ASSERT32FLAT();
-    if (!CONFIG_DEBUG_SERIAL_OXFORD)
-        return;
-
-    struct pci_device *oxpcie_dev;
-    oxpcie_bar = 0;
-    // Detect Startech MPEX1S952
-    oxpcie_dev = pci_find_device(0x1415, 0xc158);
-    if (!oxpcie_dev) // Startech PEX1S1PMINI
-        oxpcie_dev = pci_find_device(0x1415, 0xc11b);
-    if (oxpcie_dev)
-        oxpcie_bar = pci_config_readl(oxpcie_dev->bdf, 0x10);
-    if (!oxpcie_bar)
-        return;
-    // setup for serial logging: 8N1
-    volatile u8 *uart = (u8 *)OXPCIE_COM1;
-    u8 oldparam, newparam = 0x03;
-    oldparam = GET_FLATPTR(uart[SEROFF_LCR]);
-    SET_FLATPTR(uart[SEROFF_LCR], newparam);
-    // Disable irqs
-    u8 oldier, newier = 0;
-    oldier = GET_FLATPTR(uart[SEROFF_IER]);
-    SET_FLATPTR(uart[SEROFF_IER], newier);
-
-    if (oldparam != newparam || oldier != newier)
-        dprintf(1, "Changing serial settings was %x/%x now %x/%x\n"
-                , oldparam, oldier, newparam, newier);
-}
-
-static void
-debug_serial_oxford_setup(void)
-{
-    if (MODE16) {
-        extern void  _cfunc32flat_debug_serial_oxford_setup_32(void);
-        call32(_cfunc32flat_debug_serial_oxford_setup_32, 0, -1);
-    } else if (MODESEGMENT) {
-    } else {
-        debug_serial_oxford_setup_32();
-    }
-}
-
-// Write a character to the serial port.
-void  VISIBLE32FLAT
-debug_serial_oxford_32(char c)
-{
-ASSERT32FLAT();
-    volatile u8 *uart = (u8 *)OXPCIE_COM1;
-
-    if (!CONFIG_DEBUG_SERIAL_OXFORD)
-        return;
-    if (!oxpcie_bar)
-        return;
-
-    int timeout = DEBUG_TIMEOUT;
-    while ((GET_FLATPTR(uart[SEROFF_LSR]) & 0x60) != 0x60)
-        if (!timeout--)
-            // Ran out of time.
-            return;
-    SET_FLATPTR(uart[SEROFF_DATA], c);
-}
-
-static void
-debug_serial_oxford(char c)
-{
-    if (MODE16) {
-        extern void  _cfunc32flat_debug_serial_oxford_32(char c);
-        call32(_cfunc32flat_debug_serial_oxford_32, (u32)c, -1);
-    } else if (MODESEGMENT) {
-    } else {
-        debug_serial_oxford_32(c);
-    }
-}
-
-// Make sure all serial port writes have been completely sent.
-void VISIBLE32FLAT
-debug_serial_oxford_flush_32(void)
-{
-ASSERT32FLAT();
-    u8 *uart = (u8 *)OXPCIE_COM1;
-
-    if (!CONFIG_DEBUG_SERIAL_OXFORD)
-        return;
-    if (!oxpcie_bar)
-        return;
-    int timeout = DEBUG_TIMEOUT;
-
-    while ((GET_FLATPTR(uart[SEROFF_LSR]) & 0x40) != 0x40)
-        if (!timeout--)
-            // Ran out of time.
-            return;
-}
-
 void
-debug_serial_oxford_flush(void)
+debug_banner(void)
 {
-    if (MODE16) {
-        extern void  _cfunc32flat_debug_serial_oxford_flush_32(void);
-        call32(_cfunc32flat_debug_serial_oxford_flush_32, 0, -1);
-    } else if (MODESEGMENT) {
-    } else {
-        debug_serial_oxford_flush_32();
-    }
-}
-
-void
-debug_setup(void)
-{
-    if (! CONFIG_DEBUG_LEVEL)
-        return;
-    if (CONFIG_DEBUG_SERIAL)
-        debug_serial_setup();
-    if (CONFIG_DEBUG_SERIAL_OXFORD)
-        debug_serial_oxford_setup();
+    dprintf(1, "SeaBIOS (version %s)\n", VERSION);
 }
 
 // Write a character to debug port(s).
@@ -196,26 +38,17 @@ debug_putc(struct putcinfo *action, char c)
 {
     if (! CONFIG_DEBUG_LEVEL)
         return;
-    if (c == '\n')
-        debug_putc(action, '\r');
-    if (CONFIG_DEBUG_IO)
-        // Send character to debug port.
-        outb(c, PORT_BIOS_DEBUG);
-    if (CONFIG_DEBUG_SERIAL)
-        debug_serial(c);
-    if (CONFIG_DEBUG_SERIAL_OXFORD)
-        debug_serial_oxford(c);
+    qemu_debug_putc(c);
+    if (!MODESEGMENT)
+        coreboot_debug_putc(c);
+    serial_debug_putc(c);
 }
 
+// Flush any pending output to debug port(s).
 static void
 debug_flush(void)
 {
-    if (! CONFIG_DEBUG_LEVEL)
-        return;
-    if (CONFIG_DEBUG_SERIAL)
-        debug_serial_flush();
-    if (CONFIG_DEBUG_SERIAL_OXFORD)
-        debug_serial_oxford_flush();
+    serial_debug_flush();
 }
 
 // In segmented mode just need a dummy variable (debug_putc is always
@@ -248,7 +81,7 @@ screenc(char c)
 
 // Handle a character from a printf request.
 static void
-putc_screen(struct putcinfo *action, char c)
+screen_putc(struct putcinfo *action, char c)
 {
     if (ScreenAndDebug)
         debug_putc(&debuginfo, c);
@@ -257,7 +90,7 @@ putc_screen(struct putcinfo *action, char c)
     screenc(c);
 }
 
-static struct putcinfo screeninfo = { putc_screen };
+static struct putcinfo screeninfo = { screen_putc };
 
 
 /****************************************************************

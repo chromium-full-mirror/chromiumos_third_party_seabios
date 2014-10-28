@@ -11,14 +11,14 @@ menu "VGA ROM"
                 Do not build a VGA BIOS.
 
         config VGA_STANDARD_VGA
-            depends on !COREBOOT
+            depends on QEMU
             bool "QEMU/Bochs Original IBM 256K VGA"
             help
                 Build basic VGA BIOS support (pre Super-VGA) for use
                 on emulators.
 
         config VGA_CIRRUS
-            depends on !COREBOOT
+            depends on QEMU
             bool "QEMU/Bochs Cirrus SVGA"
             help
                 Build support for Cirrus VGA emulation found on QEMU
@@ -26,7 +26,7 @@ menu "VGA ROM"
                 intended for use on real Cirrus hardware.
 
         config VGA_BOCHS
-            depends on !COREBOOT
+            depends on QEMU
             bool "QEMU/Bochs VBE SVGA"
             help
                 Build support for Bochs DISPI interface (a custom VBE
@@ -43,9 +43,44 @@ menu "VGA ROM"
                 Build support for Geode LX vga.
     endchoice
 
+    choice
+        depends on VGA_GEODEGX2 || VGA_GEODELX
+        prompt "Output Mode"
+        default VGA_OUTPUT_CRT
+
+        config VGA_OUTPUT_CRT
+            bool "CRT"
+            help
+                Use CRT for output.
+
+        config VGA_OUTPUT_PANEL
+            bool "Flat Panel"
+            help
+                Use flat panel for output.
+
+        config VGA_OUTPUT_CRT_PANEL
+            bool "CRT and Flat Panel"
+            help
+                Use CRT and flat panel for output.
+    endchoice
+
     config BUILD_VGABIOS
         bool
         default !NO_VGABIOS
+
+    config VGA_ALLOCATE_EXTRA_STACK
+        depends on BUILD_VGABIOS
+        bool "Allocate an internal stack for 16bit interrupt entry point"
+        default y
+        help
+            Attempt to allocate (via BIOS PMM call) an internal stack
+            for the legacy 16bit 0x10 interrupt entry point.  This
+            reduces the amount of space on the caller's stack that
+            SeaVGABIOS uses.
+
+    config VGA_EXTRA_STACK_SIZE
+        int
+        default 512
 
     config VGA_VBE
         depends on BUILD_VGABIOS

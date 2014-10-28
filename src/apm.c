@@ -6,17 +6,19 @@
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
-#include "farptr.h" // GET_VAR
-#include "bregs.h" // struct bregs
-#include "ioport.h" // outb
-#include "util.h" // wait_irq
-#include "config.h" // CONFIG_*
 #include "biosvar.h" // GET_GLOBAL
+#include "bregs.h" // struct bregs
+#include "config.h" // CONFIG_*
+#include "fw/paravirt.h" // runningOnQEMU
+#include "output.h" // dprintf
+#include "stacks.h" // yield_toirq
+#include "util.h" // apm_shutdown
+#include "x86.h" // outb
 
 static void
 out_str(const char *str_cs)
 {
-    if (CONFIG_COREBOOT) {
+    if (!runningOnQEMU()) {
         dprintf(1, "APM request '%s'\n", str_cs);
         return;
     }
@@ -94,7 +96,7 @@ handle_155304(struct bregs *regs)
 static void
 handle_155305(struct bregs *regs)
 {
-    wait_irq();
+    yield_toirq();
     set_success(regs);
 }
 
@@ -108,7 +110,11 @@ handle_155306(struct bregs *regs)
 void
 apm_shutdown(void)
 {
+    u16 pm1a_cnt = GET_GLOBAL(acpi_pm1a_cnt);
+
     irq_disable();
+    if (pm1a_cnt)
+        outw(0x2000, pm1a_cnt);
     out_str("Shutdown");
     for (;;)
         hlt();
@@ -223,15 +229,8 @@ handle_1553(struct bregs *regs)
     }
 }
 
-void VISIBLE16
-handle_apm16(struct bregs *regs)
-{
-    debug_enter(regs, DEBUG_HDL_apm);
-    handle_1553(regs);
-}
-
-void VISIBLE32SEG
-handle_apm32(struct bregs *regs)
+void VISIBLE16 VISIBLE32SEG
+handle_apm(struct bregs *regs)
 {
     debug_enter(regs, DEBUG_HDL_apm);
     handle_1553(regs);

@@ -1,4 +1,4 @@
-// Option rom scanning code.
+// Initialize the VGA console and possibly show a boot splash image.
 //
 // Copyright (C) 2009-2010  coresystems GmbH
 // Copyright (C) 2010  Kevin O'Connor <kevin@koconnor.net>
@@ -6,14 +6,16 @@
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
 #include "bregs.h" // struct bregs
-#include "farptr.h" // FLATPTR_TO_SEG
 #include "config.h" // CONFIG_*
-#include "util.h" // dprintf
-#include "jpeg.h" // splash
-#include "biosvar.h" // SET_EBDA
-#include "paravirt.h" // romfile_find
-#include "vbe.h" // struct vbe_info
-#include "bmp.h"
+#include "farptr.h" // FLATPTR_TO_SEG
+#include "malloc.h" // free
+#include "output.h" // dprintf
+#include "romfile.h" // romfile_loadfile
+#include "stacks.h" // call16_int
+#include "std/vbe.h" // struct vbe_info
+#include "string.h" // memset
+#include "util.h" // enable_bootsplash
+
 
 /****************************************************************
  * Helper functions
@@ -46,7 +48,8 @@ enable_vga_console(void)
     call16_int10(&br);
 
     // Write to screen.
-    printf("SeaBIOS (version %s)\n\n", VERSION);
+    printf("SeaBIOS (version %s)\n", VERSION);
+    display_uuid();
 }
 
 static int
@@ -65,7 +68,7 @@ find_videomode(struct vbe_info *vesa_info, struct vbe_mode_info *mode_info
         struct bregs br;
         memset(&br, 0, sizeof(br));
         br.ax = 0x4f01;
-        br.cx = (1 << 14) | videomode;
+        br.cx = videomode;
         br.di = FLATPTR_TO_OFFSET(mode_info);
         br.es = FLATPTR_TO_SEG(mode_info);
         call16_int10(&br);
@@ -218,7 +221,7 @@ enable_bootsplash(void)
     dprintf(5, "Switching to graphics mode\n");
     memset(&br, 0, sizeof(br));
     br.ax = 0x4f02;
-    br.bx = (1 << 14) | videomode;
+    br.bx = videomode | VBE_MODE_LINEAR_FRAME_BUFFER;
     call16_int10(&br);
     if (br.ax != 0x4f) {
         dprintf(1, "set_mode failed.\n");
