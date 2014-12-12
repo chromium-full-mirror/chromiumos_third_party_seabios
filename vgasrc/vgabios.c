@@ -248,7 +248,7 @@ bda_save_restore(int cmd, u16 seg, void *data)
                    , sizeof(info->bda_0x49));
         memcpy_far(seg, info->bda_0x84, SEG_BDA, (void*)0x84
                    , sizeof(info->bda_0x84));
-        SET_FARVAR(seg, info->vbe_mode, GET_BDA(vbe_mode));
+        SET_FARVAR(seg, info->vbe_mode, GET_BDA_EXT(vbe_mode));
         SET_FARVAR(seg, info->font0, GET_IVT(0x1f));
         SET_FARVAR(seg, info->font1, GET_IVT(0x43));
     }
@@ -257,7 +257,7 @@ bda_save_restore(int cmd, u16 seg, void *data)
                    , sizeof(info->bda_0x49));
         memcpy_far(SEG_BDA, (void*)0x84, seg, info->bda_0x84
                    , sizeof(info->bda_0x84));
-        SET_BDA(vbe_mode, GET_FARVAR(seg, info->vbe_mode));
+        SET_BDA_EXT(vbe_mode, GET_FARVAR(seg, info->vbe_mode));
         SET_IVT(0x1f, GET_FARVAR(seg, info->font0));
         SET_IVT(0x43, GET_FARVAR(seg, info->font1));
     }
@@ -272,7 +272,7 @@ bda_save_restore(int cmd, u16 seg, void *data)
 struct vgamode_s *
 get_current_mode(void)
 {
-    return vgahw_find_mode(GET_BDA(vbe_mode) & ~MF_VBEFLAGS);
+    return vgahw_find_mode(GET_BDA_EXT(vbe_mode) & ~MF_VBEFLAGS);
 }
 
 // Setup BDA after a mode switch.
@@ -297,7 +297,7 @@ vga_set_mode(int mode, int flags)
         SET_BDA(video_mode, mode);
     else
         SET_BDA(video_mode, 0xff);
-    SET_BDA(vbe_mode, mode | (flags & MF_VBEFLAGS));
+    SET_BDA_EXT(vbe_mode, mode | (flags & MF_VBEFLAGS));
     if (memmodel == MM_TEXT) {
         SET_BDA(video_cols, width);
         SET_BDA(video_rows, height-1);
