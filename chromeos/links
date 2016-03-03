@@ -15,3 +15,6 @@ pci8086,1616.rom pci8086,0406.rom # BDW U GT2
 pci8086,1626.rom pci8086,0406.rom # BDW U GT3 15W
 pci8086,162b.rom pci8086,0406.rom # BDW U GT3 28W
 pci8086,161e.rom pci8086,0406.rom # BDW Y GT2
+pci8086,1906.rom seavgabios.rom # Skylake GT1 ULT
+pci8086,191e.rom seavgabios.rom # Skylake GT2 ULX
+pci8086,1916.rom seavgabios.rom # Skylake GT2 ULT
