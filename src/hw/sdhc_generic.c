@@ -454,7 +454,7 @@ bool sdhc_cmd(sdhc_t* sd_ctrl_p, sdxfer_t* xfer_p) {
     bar_write8(sd_ctrl_p->bar_address, SDHCI_COMMAND, xfer_p->cmd_idx);
 
     if (xfer_p->rsp_type != rsp_none_e) {
-        if (!sdhc_poll_intr_status(sd_ctrl_p, xfer_p, SDHCI_INT_RESPONSE, 1000)) {
+        if (!sdhc_poll_intr_status(sd_ctrl_p, xfer_p, SDHCI_INT_RESPONSE, 10000)) {
             dprintf(DEBUG_HDL_SD,
                     "SDHC: failed to receive response to command\n");
             return false;
@@ -493,7 +493,7 @@ static void sdhc_read_block(sdhc_t* sdctrl_p, sdxfer_t* xfer_p) {
 
     for (count = 0; count < xfer_p->block_count; count++) {
         // wait for DATA_AVAILABLE Interrupt
-        if (!sdhc_poll_intr_status(sdctrl_p, xfer_p, SDHCI_INT_DATA_AVAIL, 1000)) {
+        if (!sdhc_poll_intr_status(sdctrl_p, xfer_p, SDHCI_INT_DATA_AVAIL, 10000)) {
             dprintf(DEBUG_HDL_SD,
                     "SDHC: failed to receive Data Available Interrupt\n");
             return;
