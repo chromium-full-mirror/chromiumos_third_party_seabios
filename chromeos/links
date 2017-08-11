@@ -18,3 +18,8 @@ pci8086,161e.rom pci8086,0406.rom # BDW Y GT2
 pci8086,1906.rom seavgabios.rom # Skylake GT1 ULT
 pci8086,191e.rom seavgabios.rom # Skylake GT2 ULX
 pci8086,1916.rom seavgabios.rom # Skylake GT2 ULT
+pci8086,5906.rom seavgabios.rom # Kabylake GT1 SULTM
+pci8086,591e.rom seavgabios.rom # Kabylake GT2 SULXM
+pci8086,5916.rom seavgabios.rom # Kabylake GT2 SULTM
+pci8086,5917.rom seavgabios.rom # Kabylake GT2 SULTMR
+pci8086,591b.rom seavgabios.rom # Kabylake GT2 SHALM
