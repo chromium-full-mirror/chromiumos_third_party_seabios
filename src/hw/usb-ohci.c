@@ -7,12 +7,14 @@
 #include "biosvar.h" // GET_LOWFLAT
 #include "config.h" // CONFIG_*
 #include "malloc.h" // free
+#include "memmap.h" // PAGE_SIZE
 #include "output.h" // dprintf
-#include "pci.h" // pci_bdf_to_bus
+#include "pcidevice.h" // foreachpci
 #include "pci_ids.h" // PCI_CLASS_SERIAL_USB_OHCI
 #include "pci_regs.h" // PCI_BASE_ADDRESS_0
 #include "string.h" // memset
 #include "usb.h" // struct usb_s
+#include "usb-ehci.h" // ehci_wait_controllers
 #include "usb-ohci.h" // struct ohci_hcca
 #include "util.h" // msleep
 #include "x86.h" // readl
@@ -27,6 +29,7 @@ struct usb_ohci_s {
 struct ohci_pipe {
     struct ohci_ed ed;
     struct usb_pipe pipe;
+    struct ohci_regs *regs;
     void *data;
     int count;
     struct ohci_td *tds;
@@ -94,6 +97,8 @@ static int
 check_ohci_ports(struct usb_ohci_s *cntl)
 {
     ASSERT32FLAT();
+    // Wait for ehci init - in case this is a "companion controller"
+    ehci_wait_controllers();
     // Turn on power for all devices on roothub.
     u32 rha = readl(&cntl->regs->roothub_a);
     rha &= ~(RH_A_PSM | RH_A_OCPM);
@@ -118,10 +123,10 @@ check_ohci_ports(struct usb_ohci_s *cntl)
 
 // Wait for next USB frame to start - for ensuring safe memory release.
 static void
-ohci_waittick(struct usb_ohci_s *cntl)
+ohci_waittick(struct ohci_regs *regs)
 {
     barrier();
-    struct ohci_hcca *hcca = (void*)cntl->regs->hcca;
+    struct ohci_hcca *hcca = (void*)regs->hcca;
     u32 startframe = hcca->frame_no;
     u32 end = timer_calc(1000 * 5);
     for (;;) {
@@ -143,7 +148,7 @@ ohci_free_pipes(struct usb_ohci_s *cntl)
     u32 creg = readl(&cntl->regs->control);
     if (creg & (OHCI_CTRL_CLE|OHCI_CTRL_BLE)) {
         writel(&cntl->regs->control, creg & ~(OHCI_CTRL_CLE|OHCI_CTRL_BLE));
-        ohci_waittick(cntl);
+        ohci_waittick(cntl->regs);
     }
 
     u32 *pos = &cntl->regs->ed_controlhead;
@@ -209,7 +214,7 @@ start_ohci(struct usb_ohci_s *cntl, struct ohci_hcca *hcca)
 
     // Go into operational state
     writel(&cntl->regs->control
-           , (OHCI_CTRL_CBSR | OHCI_CTRL_CLE | OHCI_CTRL_PLE
+           , (OHCI_CTRL_CBSR | OHCI_CTRL_CLE | OHCI_CTRL_BLE | OHCI_CTRL_PLE
               | OHCI_USB_OPER | oldrwc));
     readl(&cntl->regs->control); // flush writes
 
@@ -263,6 +268,10 @@ free:
 static void
 ohci_controller_setup(struct pci_device *pci)
 {
+    struct ohci_regs *regs = pci_enable_membar(pci, PCI_BASE_ADDRESS_0);
+    if (!regs)
+        return;
+
     struct usb_ohci_s *cntl = malloc_tmphigh(sizeof(*cntl));
     if (!cntl) {
         warn_noalloc();
@@ -271,19 +280,11 @@ ohci_controller_setup(struct pci_device *pci)
     memset(cntl, 0, sizeof(*cntl));
     cntl->usb.pci = pci;
     cntl->usb.type = USB_TYPE_OHCI;
+    cntl->regs = regs;
 
-    wait_preempt();  // Avoid pci_config_readl when preempting
-    u16 bdf = pci->bdf;
-    u32 baseaddr = pci_config_readl(bdf, PCI_BASE_ADDRESS_0);
-    cntl->regs = (void*)(baseaddr & PCI_BASE_ADDRESS_MEM_MASK);
+    dprintf(1, "OHCI init on dev %pP (regs=%p)\n", pci, cntl->regs);
 
-    dprintf(1, "OHCI init on dev %02x:%02x.%x (regs=%p)\n"
-            , pci_bdf_to_bus(bdf), pci_bdf_to_dev(bdf)
-            , pci_bdf_to_fn(bdf), cntl->regs);
-
-    // Enable bus mastering and memory access.
-    pci_config_maskw(bdf, PCI_COMMAND
-                     , 0, PCI_COMMAND_MASTER|PCI_COMMAND_MEMORY);
+    pci_enable_busmaster(pci);
 
     // XXX - check for and disable SMM control?
 
@@ -320,6 +321,9 @@ ohci_desc2pipe(struct ohci_pipe *pipe, struct usbdevice_s *usbdev
     pipe->ed.hwINFO = (ED_SKIP | usbdev->devaddr | (pipe->pipe.ep << 7)
                        | (epdesc->wMaxPacketSize << 16)
                        | (usbdev->speed ? ED_LOWSPEED : 0));
+    struct usb_ohci_s *cntl = container_of(
+        usbdev->hub->cntl, struct usb_ohci_s, usb);
+    pipe->regs = cntl->regs;
 }
 
 static struct usb_pipe *
@@ -398,10 +402,6 @@ ohci_realloc_pipe(struct usbdevice_s *usbdev, struct usb_pipe *upipe
     u8 eptype = epdesc->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
     if (eptype == USB_ENDPOINT_XFER_INT)
         return ohci_alloc_intr_pipe(usbdev, epdesc);
-    if (eptype != USB_ENDPOINT_XFER_CONTROL) {
-        dprintf(1, "OHCI Bulk transfers not supported.\n");
-        return NULL;
-    }
     struct usb_ohci_s *cntl = container_of(
         usbdev->hub->cntl, struct usb_ohci_s, usb);
     dprintf(7, "ohci_alloc_async_pipe %p\n", &cntl->usb);
@@ -415,7 +415,11 @@ ohci_realloc_pipe(struct usbdevice_s *usbdev, struct usb_pipe *upipe
     }
 
     // Allocate a new queue head.
-    struct ohci_pipe *pipe = malloc_tmphigh(sizeof(*pipe));
+    struct ohci_pipe *pipe;
+    if (eptype == USB_ENDPOINT_XFER_CONTROL)
+        pipe = malloc_tmphigh(sizeof(*pipe));
+    else
+        pipe = malloc_low(sizeof(*pipe));
     if (!pipe) {
         warn_noalloc();
         return NULL;
@@ -424,9 +428,12 @@ ohci_realloc_pipe(struct usbdevice_s *usbdev, struct usb_pipe *upipe
     ohci_desc2pipe(pipe, usbdev, epdesc);
 
     // Add queue head to controller list.
-    pipe->ed.hwNextED = cntl->regs->ed_controlhead;
+    u32 *head = &cntl->regs->ed_controlhead;
+    if (eptype != USB_ENDPOINT_XFER_CONTROL)
+        head = &cntl->regs->ed_bulkhead;
+    pipe->ed.hwNextED = *head;
     barrier();
-    cntl->regs->ed_controlhead = (u32)&pipe->ed;
+    *head = (u32)&pipe->ed;
     return &pipe->pipe;
 }
 
@@ -435,76 +442,92 @@ wait_ed(struct ohci_ed *ed, int timeout)
 {
     u32 end = timer_calc(timeout);
     for (;;) {
-        if (ed->hwHeadP == ed->hwTailP)
+        if ((ed->hwHeadP & ~(ED_C|ED_H)) == ed->hwTailP)
             return 0;
         if (timer_check(end)) {
             warn_timeout();
+            dprintf(1, "ohci ed info=%x tail=%x head=%x next=%x\n"
+                    , ed->hwINFO, ed->hwTailP, ed->hwHeadP, ed->hwNextED);
             return -1;
         }
         yield();
     }
 }
 
+#define STACKOTDS 18
+#define OHCI_TD_ALIGN 16
+
 int
-ohci_send_control(struct usb_pipe *p, int dir, const void *cmd, int cmdsize
-                  , void *data, int datasize)
+ohci_send_pipe(struct usb_pipe *p, int dir, const void *cmd
+               , void *data, int datasize)
 {
+    ASSERT32FLAT();
     if (! CONFIG_USB_OHCI)
         return -1;
-    dprintf(5, "ohci_control %p\n", p);
-    if (datasize > 4096) {
-        // XXX - should support larger sizes.
-        warn_noalloc();
-        return -1;
-    }
+    dprintf(7, "ohci_send_pipe %p\n", p);
     struct ohci_pipe *pipe = container_of(p, struct ohci_pipe, pipe);
-    struct usb_ohci_s *cntl = container_of(
-        pipe->pipe.cntl, struct usb_ohci_s, usb);
+
+    // Allocate tds on stack (with required alignment)
+    u8 tdsbuf[sizeof(struct ohci_td) * STACKOTDS + OHCI_TD_ALIGN - 1];
+    struct ohci_td *tds = (void*)ALIGN((u32)tdsbuf, OHCI_TD_ALIGN), *td = tds;
+    memset(tds, 0, sizeof(*tds) * STACKOTDS);
 
     // Setup transfer descriptors
-    struct ohci_td *tds = malloc_tmphigh(sizeof(*tds) * 3);
-    if (!tds) {
-        warn_noalloc();
-        return -1;
-    }
-    struct ohci_td *td = tds;
-    td->hwINFO = TD_DP_SETUP | TD_T_DATA0 | TD_CC;
-    td->hwCBP = (u32)cmd;
-    td->hwNextTD = (u32)&td[1];
-    td->hwBE = (u32)cmd + cmdsize - 1;
-    td++;
-    if (datasize) {
-        td->hwINFO = (dir ? TD_DP_IN : TD_DP_OUT) | TD_T_DATA1 | TD_CC;
-        td->hwCBP = (u32)data;
+    u16 maxpacket = pipe->pipe.maxpacket;
+    u32 toggle = 0, statuscmd = OHCI_BLF;
+    if (cmd) {
+        // Send setup pid on control transfers
+        td->hwINFO = TD_DP_SETUP | TD_T_DATA0 | TD_CC;
+        td->hwCBP = (u32)cmd;
         td->hwNextTD = (u32)&td[1];
-        td->hwBE = (u32)data + datasize - 1;
+        td->hwBE = (u32)cmd + USB_CONTROL_SETUP_SIZE - 1;
+        td++;
+        toggle = TD_T_DATA1;
+        statuscmd = OHCI_CLF;
+    }
+    u32 dest = (u32)data, dataend = dest + datasize;
+    while (dest < dataend) {
+        // Send data pids
+        if (td >= &tds[STACKOTDS]) {
+            warn_noalloc();
+            return -1;
+        }
+        int maxtransfer = 2*PAGE_SIZE - (dest & (PAGE_SIZE-1));
+        int transfer = dataend - dest;
+        if (transfer > maxtransfer)
+            transfer = ALIGN_DOWN(maxtransfer, maxpacket);
+        td->hwINFO = (dir ? TD_DP_IN : TD_DP_OUT) | toggle | TD_CC;
+        td->hwCBP = dest;
+        td->hwNextTD = (u32)&td[1];
+        td->hwBE = dest + transfer - 1;
+        td++;
+        dest += transfer;
+    }
+    if (cmd) {
+        // Send status pid on control transfers
+        if (td >= &tds[STACKOTDS]) {
+            warn_noalloc();
+            return -1;
+        }
+        td->hwINFO = (dir ? TD_DP_OUT : TD_DP_IN) | TD_T_DATA1 | TD_CC;
+        td->hwCBP = 0;
+        td->hwNextTD = (u32)&td[1];
+        td->hwBE = 0;
         td++;
     }
-    td->hwINFO = (dir ? TD_DP_OUT : TD_DP_IN) | TD_T_DATA1 | TD_CC;
-    td->hwCBP = 0;
-    td->hwNextTD = (u32)&td[1];
-    td->hwBE = 0;
-    td++;
 
     // Transfer data
-    pipe->ed.hwHeadP = (u32)tds;
+    pipe->ed.hwHeadP = (u32)tds | (pipe->ed.hwHeadP & ED_C);
     pipe->ed.hwTailP = (u32)td;
     barrier();
     pipe->ed.hwINFO &= ~ED_SKIP;
-    writel(&cntl->regs->cmdstatus, OHCI_CLF);
+    writel(&pipe->regs->cmdstatus, statuscmd);
 
     int ret = wait_ed(&pipe->ed, usb_xfer_time(p, datasize));
     pipe->ed.hwINFO |= ED_SKIP;
     if (ret)
-        ohci_waittick(cntl);
-    free(tds);
+        ohci_waittick(pipe->regs);
     return ret;
-}
-
-int
-ohci_send_bulk(struct usb_pipe *p, int dir, void *data, int datasize)
-{
-    return -1;
 }
 
 int

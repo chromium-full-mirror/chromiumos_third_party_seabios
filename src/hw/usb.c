@@ -8,6 +8,7 @@
 #include "config.h" // CONFIG_*
 #include "malloc.h" // free
 #include "output.h" // dprintf
+#include "romfile.h" // romfile_loadint
 #include "string.h" // memset
 #include "usb.h" // struct usb_s
 #include "usb-ehci.h" // ehci_setup
@@ -46,38 +47,23 @@ usb_realloc_pipe(struct usbdevice_s *usbdev, struct usb_pipe *pipe
 
 // Send a message on a control pipe using the default control descriptor.
 static int
-usb_send_control(struct usb_pipe *pipe, int dir, const void *cmd, int cmdsize
-                 , void *data, int datasize)
-{
-    ASSERT32FLAT();
-    switch (pipe->type) {
-    default:
-    case USB_TYPE_UHCI:
-        return uhci_send_control(pipe, dir, cmd, cmdsize, data, datasize);
-    case USB_TYPE_OHCI:
-        return ohci_send_control(pipe, dir, cmd, cmdsize, data, datasize);
-    case USB_TYPE_EHCI:
-        return ehci_send_control(pipe, dir, cmd, cmdsize, data, datasize);
-    case USB_TYPE_XHCI:
-        return xhci_send_control(pipe, dir, cmd, cmdsize, data, datasize);
-    }
-}
-
-int
-usb_send_bulk(struct usb_pipe *pipe_fl, int dir, void *data, int datasize)
+usb_send_pipe(struct usb_pipe *pipe_fl, int dir, const void *cmd
+              , void *data, int datasize)
 {
     switch (GET_LOWFLAT(pipe_fl->type)) {
     default:
     case USB_TYPE_UHCI:
-        return uhci_send_bulk(pipe_fl, dir, data, datasize);
+        return uhci_send_pipe(pipe_fl, dir, cmd, data, datasize);
     case USB_TYPE_OHCI:
-        return ohci_send_bulk(pipe_fl, dir, data, datasize);
+        if (MODESEGMENT)
+            return -1;
+        return ohci_send_pipe(pipe_fl, dir, cmd, data, datasize);
     case USB_TYPE_EHCI:
-        return ehci_send_bulk(pipe_fl, dir, data, datasize);
+        return ehci_send_pipe(pipe_fl, dir, cmd, data, datasize);
     case USB_TYPE_XHCI:
         if (MODESEGMENT)
             return -1;
-        return xhci_send_bulk(pipe_fl, dir, data, datasize);
+        return xhci_send_pipe(pipe_fl, dir, cmd, data, datasize);
     }
 }
 
@@ -94,15 +80,15 @@ usb_poll_intr(struct usb_pipe *pipe_fl, void *data)
     case USB_TYPE_EHCI:
         return ehci_poll_intr(pipe_fl, data);
     case USB_TYPE_XHCI: ;
-        extern void _cfunc32flat_xhci_poll_intr(void);
-        return call32_params(_cfunc32flat_xhci_poll_intr, (u32)pipe_fl
-                             , (u32)MAKE_FLATPTR(GET_SEG(SS), (u32)data), 0, -1);
+        return call32_params(xhci_poll_intr, pipe_fl
+                             , MAKE_FLATPTR(GET_SEG(SS), data), 0, -1);
     }
 }
 
 int usb_32bit_pipe(struct usb_pipe *pipe_fl)
 {
-    return CONFIG_USB_XHCI && GET_LOWFLAT(pipe_fl->type) == USB_TYPE_XHCI;
+    return (CONFIG_USB_XHCI && GET_LOWFLAT(pipe_fl->type) == USB_TYPE_XHCI)
+        || (CONFIG_USB_OHCI && GET_LOWFLAT(pipe_fl->type) == USB_TYPE_OHCI);
 }
 
 
@@ -132,8 +118,15 @@ int
 usb_send_default_control(struct usb_pipe *pipe, const struct usb_ctrlrequest *req
                          , void *data)
 {
-    return usb_send_control(pipe, req->bRequestType & USB_DIR_IN
-                            , req, sizeof(*req), data, req->wLength);
+    return usb_send_pipe(pipe, req->bRequestType & USB_DIR_IN, req
+                         , data, req->wLength);
+}
+
+// Send a message to a bulk endpoint
+int
+usb_send_bulk(struct usb_pipe *pipe_fl, int dir, void *data, int datasize)
+{
+    return usb_send_pipe(pipe_fl, dir, NULL, data, datasize);
 }
 
 // Check if a pipe for a given controller is on the freelist
@@ -256,12 +249,16 @@ get_device_config(struct usb_pipe *pipe)
         return NULL;
 
     void *config = malloc_tmphigh(cfg.wTotalLength);
-    if (!config)
+    if (!config) {
+        warn_noalloc();
         return NULL;
+    }
     req.wLength = cfg.wTotalLength;
     ret = usb_send_default_control(pipe, &req, config);
-    if (ret)
+    if (ret) {
+        free(config);
         return NULL;
+    }
     //hexdump(config, cfg.wTotalLength);
     return config;
 }
@@ -459,12 +456,14 @@ resetfail:
     goto done;
 }
 
+static u32 usb_time_sigatt;
+
 void
 usb_enumerate(struct usbhub_s *hub)
 {
     u32 portcount = hub->portcount;
     hub->threads = portcount;
-    hub->detectend = timer_calc(USB_TIME_SIGATT);
+    hub->detectend = timer_calc(usb_time_sigatt);
 
     // Launch a thread for every port.
     int i;
@@ -486,20 +485,15 @@ usb_enumerate(struct usbhub_s *hub)
 }
 
 void
-__usb_setup(void *data)
-{
-    dprintf(3, "init usb\n");
-    xhci_setup();
-    ehci_setup();
-    uhci_setup();
-    ohci_setup();
-}
-
-void
 usb_setup(void)
 {
     ASSERT32FLAT();
     if (! CONFIG_USB)
         return;
-    run_thread(__usb_setup, NULL);
+    dprintf(3, "init usb\n");
+    usb_time_sigatt = romfile_loadint("etc/usb-time-sigatt", USB_TIME_SIGATT);
+    xhci_setup();
+    ehci_setup();
+    uhci_setup();
+    ohci_setup();
 }

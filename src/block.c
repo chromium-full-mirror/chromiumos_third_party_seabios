@@ -2,7 +2,6 @@
 //
 // Copyright (C) 2008,2009  Kevin O'Connor <kevin@koconnor.net>
 // Copyright (C) 2002  MandrakeSoft S.A.
-// Copyright (C) 2013 Sage Electronic Engineering, LLC
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
@@ -10,24 +9,28 @@
 #include "block.h" // process_op
 #include "hw/ata.h" // process_ata_op
 #include "hw/ahci.h" // process_ahci_op
-#include "hw/blockcmd.h" // cdb_*
+#include "hw/esp-scsi.h" // esp_scsi_process_op
+#include "hw/lsi-scsi.h" // lsi_scsi_process_op
+#include "hw/megasas.h" // megasas_process_op
+#include "hw/mpt-scsi.h" // mpt_scsi_process_op
 #include "hw/pci.h" // pci_bdf_to_bus
+#include "hw/pvscsi.h" // pvscsi_process_op
 #include "hw/rtc.h" // rtc_read
+#include "hw/usb-msc.h" // usb_process_op
+#include "hw/usb-uas.h" // uas_process_op
 #include "hw/virtio-blk.h" // process_virtio_blk_op
-#include "hw/sd_if.h" // process_sd_op
+#include "hw/virtio-scsi.h" // virtio_scsi_process_op
+#include "hw/nvme.h" // nvme_process_op
 #include "malloc.h" // malloc_low
 #include "output.h" // dprintf
-#include "stacks.h" // stack_hop
+#include "stacks.h" // call32
 #include "std/disk.h" // struct dpte_s
 #include "string.h" // checksum
 #include "util.h" // process_floppy_op
 
-#define MAX_DRIVE_TYPES 4
-
 u8 FloppyCount VARFSEG;
 u8 CDCount;
-
-struct drive_s *IDMap[MAX_DRIVE_TYPES][BUILD_MAX_EXTDRIVE] VARFSEG;
+struct drive_s *IDMap[3][BUILD_MAX_EXTDRIVE] VARFSEG;
 u8 *bounce_buf_fl VARFSEG;
 
 struct drive_s *
@@ -66,16 +69,23 @@ int create_bounce_buf(void)
  * Disk geometry translation
  ****************************************************************/
 
+static int
+host_lchs_supplied(struct drive_s *drive)
+{
+    return (drive->lchs.head <= 255 &&
+            drive->lchs.sector > 0 && drive->lchs.sector <= 63);
+}
+
 static u8
 get_translation(struct drive_s *drive)
 {
+    if (host_lchs_supplied(drive))
+        return TRANSLATION_HOST;
     u8 type = drive->type;
     if (CONFIG_QEMU && type == DTYPE_ATA) {
         // Emulators pass in the translation info via nvram.
-        u8 ataid = drive->cntl_id;
-        u8 channel = ataid / 2;
-        u8 translation = rtc_read(CMOS_BIOS_DISKTRANSFLAG + channel/2);
-        translation >>= 2 * (ataid % 4);
+        u8 translation = rtc_read(CMOS_BIOS_DISKTRANSFLAG + drive->cntl_id/4);
+        translation >>= 2 * (drive->cntl_id % 4);
         translation &= 0x03;
         return translation;
     }
@@ -158,16 +168,21 @@ setup_translation(struct drive_s *drive)
                 break;
         }
         break;
+    case TRANSLATION_HOST:
+        desc = "host-supplied";
+        cylinders = drive->lchs.cylinder;
+        heads = drive->lchs.head;
+        spt = drive->lchs.sector;
+        break;
     }
     // clip to 1024 cylinders in lchs
     if (cylinders > 1024)
         cylinders = 1024;
-    dprintf(1, "drive %p: PCHS=%u/%d/%d translation=%s LCHS=%d/%d/%d s=%08x%08x\n"
+    dprintf(1, "drive %p: PCHS=%u/%d/%d translation=%s LCHS=%d/%d/%d s=%u\n"
             , drive
             , drive->pchs.cylinder, drive->pchs.head, drive->pchs.sector
             , desc
             , cylinders, heads, spt
-            , (u32)(sectors >> 32)
             , (u32)sectors);
 
     drive->lchs.head = heads;
@@ -283,32 +298,26 @@ map_floppy_drive(struct drive_s *drive)
     }
 }
 
-// Map a SD card
-void
-map_sd_drive(struct drive_s *drive)
-{
-    ASSERT32FLAT();
-    struct bios_data_area_s *bda = MAKE_FLATPTR(SEG_BDA, 0);
-    int sdid = bda->hdcount;
-    dprintf(3, "Mapping sd/mmc drive %p to %d\n", drive, sdid);
-    add_drive(IDMap[EXTTYPE_HD], &bda->hdcount, drive);
-
-    // Setup disk geometry translation.
-    setup_translation(drive);
-
-    // Fill "fdpt" structure.
-    fill_fdpt(drive, sdid);
-}
 
 /****************************************************************
  * Extended Disk Drive (EDD) get drive parameters
  ****************************************************************/
 
+// flags for bus_iface field in fill_generic_edd()
+#define EDD_ISA        0x01
+#define EDD_PCI        0x02
+#define EDD_BUS_MASK   0x0f
+#define EDD_ATA        0x10
+#define EDD_SCSI       0x20
+#define EDD_IFACE_MASK 0xf0
+
+// Fill in EDD info
 static int
-fill_generic_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf
-                 , u32 dpte_so, char *iface_type
-                 , int bdf, u8 channel, u16 iobase, u64 device_path)
+fill_generic_edd(struct segoff_s edd, struct drive_s *drive_fl
+                 , u32 dpte_so, u8 bus_iface, u32 iface_path, u32 device_path)
 {
+    u16 seg = edd.seg;
+    struct int13dpt_s *param_far = (void*)(edd.offset+0);
     u16 size = GET_FARVAR(seg, param_far->size);
     u16 t13 = size == 74;
 
@@ -318,12 +327,12 @@ fill_generic_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf
 
     // EDD 1.x
 
-    u8  type    = GET_GLOBALFLAT(drive_gf->type);
-    u16 npc     = GET_GLOBALFLAT(drive_gf->pchs.cylinder);
-    u16 nph     = GET_GLOBALFLAT(drive_gf->pchs.head);
-    u16 nps     = GET_GLOBALFLAT(drive_gf->pchs.sector);
-    u64 lba     = GET_GLOBALFLAT(drive_gf->sectors);
-    u16 blksize = GET_GLOBALFLAT(drive_gf->blksize);
+    u8  type    = GET_FLATPTR(drive_fl->type);
+    u16 npc     = GET_FLATPTR(drive_fl->pchs.cylinder);
+    u16 nph     = GET_FLATPTR(drive_fl->pchs.head);
+    u16 nps     = GET_FLATPTR(drive_fl->pchs.sector);
+    u64 lba     = GET_FLATPTR(drive_fl->sectors);
+    u16 blksize = GET_FLATPTR(drive_fl->blksize);
 
     dprintf(DEBUG_HDL_13, "disk_1348 size=%d t=%d chs=%d,%d,%d lba=%d bs=%d\n"
             , size, type, npc, nph, nps, (u32)lba, blksize);
@@ -357,7 +366,7 @@ fill_generic_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf
     SET_FARVAR(seg, param_far->size, 30);
     SET_FARVAR(seg, param_far->dpte.segoff, dpte_so);
 
-    if (size < 66 || !iface_type)
+    if (size < 66 || !bus_iface)
         return DISK_RET_SUCCESS;
 
     // EDD 3.x
@@ -366,32 +375,22 @@ fill_generic_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf
     SET_FARVAR(seg, param_far->reserved1, 0);
     SET_FARVAR(seg, param_far->reserved2, 0);
 
-    int i;
-    for (i=0; i<sizeof(param_far->iface_type); i++)
-        SET_FARVAR(seg, param_far->iface_type[i], GET_GLOBAL(iface_type[i]));
-
-    if (bdf != -1) {
-        SET_FARVAR(seg, param_far->host_bus[0], 'P');
-        SET_FARVAR(seg, param_far->host_bus[1], 'C');
-        SET_FARVAR(seg, param_far->host_bus[2], 'I');
-        SET_FARVAR(seg, param_far->host_bus[3], ' ');
-
-        u32 path = (pci_bdf_to_bus(bdf) | (pci_bdf_to_dev(bdf) << 8)
-                    | (pci_bdf_to_fn(bdf) << 16));
-        if (t13)
-            path |= channel << 24;
-
-        SET_FARVAR(seg, param_far->iface_path, path);
-    } else {
-        // ISA
-        SET_FARVAR(seg, param_far->host_bus[0], 'I');
-        SET_FARVAR(seg, param_far->host_bus[1], 'S');
-        SET_FARVAR(seg, param_far->host_bus[2], 'A');
-        SET_FARVAR(seg, param_far->host_bus[3], ' ');
-
-        SET_FARVAR(seg, param_far->iface_path, iobase);
+    const char *host_bus = "ISA ";
+    if ((bus_iface & EDD_BUS_MASK) == EDD_PCI) {
+        host_bus = "PCI ";
+        if (!t13)
+            // Phoenix v3 spec (pre t13) did not define the PCI channel field
+            iface_path &= 0x00ffffff;
     }
+    memcpy_far(seg, param_far->host_bus, SEG_BIOS, host_bus
+               , sizeof(param_far->host_bus));
+    SET_FARVAR(seg, param_far->iface_path, iface_path);
 
+    const char *iface_type = "ATA     ";
+    if ((bus_iface & EDD_IFACE_MASK) == EDD_SCSI)
+        iface_type = "SCSI    ";
+    memcpy_far(seg, param_far->iface_type, SEG_BIOS, iface_type
+               , sizeof(param_far->iface_type));
     if (t13) {
         SET_FARVAR(seg, param_far->t13.device_path[0], device_path);
         SET_FARVAR(seg, param_far->t13.device_path[1], 0);
@@ -408,10 +407,19 @@ fill_generic_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf
     return DISK_RET_SUCCESS;
 }
 
+// Build an EDD "iface_path" field for a PCI device
+static u32
+edd_pci_path(u16 bdf, u8 channel)
+{
+    return (pci_bdf_to_bus(bdf) | (pci_bdf_to_dev(bdf) << 8)
+            | (pci_bdf_to_fn(bdf) << 16) | ((u32)channel << 24));
+}
+
 struct dpte_s DefaultDPTE VARLOW;
 
+// EDD info for ATA and ATAPI drives
 static int
-fill_ata_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf)
+fill_ata_edd(struct segoff_s edd, struct drive_s *drive_gf)
 {
     if (!CONFIG_ATA)
         return DISK_RET_EPARAM;
@@ -430,7 +438,8 @@ fill_ata_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf)
     u16 options = 0;
     if (GET_GLOBALFLAT(drive_gf->type) == DTYPE_ATA) {
         u8 translation = GET_GLOBALFLAT(drive_gf->translation);
-        if (translation != TRANSLATION_NONE) {
+        if ((translation != TRANSLATION_NONE) &&
+            (translation != TRANSLATION_HOST)) {
             options |= 1<<3; // CHS translation
             if (translation == TRANSLATION_LBA)
                 options |= 1<<9;
@@ -462,142 +471,169 @@ fill_ata_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf)
     u8 sum = checksum_far(SEG_LOW, &DefaultDPTE, 15);
     SET_LOW(DefaultDPTE.checksum, -sum);
 
+    u32 bustype = EDD_ISA, ifpath = iobase1;
+    if (bdf >= 0) {
+        bustype = EDD_PCI;
+        ifpath = edd_pci_path(bdf, channel);
+    }
     return fill_generic_edd(
-        seg, param_far, drive_gf, SEGOFF(SEG_LOW, (u32)&DefaultDPTE).segoff
-        , "ATA     ", bdf, channel, iobase1, slave);
+        edd, drive_gf, SEGOFF(SEG_LOW, (u32)&DefaultDPTE).segoff
+        , bustype | EDD_ATA, ifpath, slave);
 }
 
+// Fill Extended Disk Drive (EDD) "Get drive parameters" info for a drive
 int noinline
-fill_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf)
+fill_edd(struct segoff_s edd, struct drive_s *drive_fl)
 {
-    switch (GET_GLOBALFLAT(drive_gf->type)) {
+    switch (GET_FLATPTR(drive_fl->type)) {
     case DTYPE_ATA:
     case DTYPE_ATA_ATAPI:
-        return fill_ata_edd(seg, param_far, drive_gf);
+        return fill_ata_edd(edd, drive_fl);
     case DTYPE_VIRTIO_BLK:
     case DTYPE_VIRTIO_SCSI:
         return fill_generic_edd(
-            seg, param_far, drive_gf, 0xffffffff
-            , "SCSI    ", GET_GLOBALFLAT(drive_gf->cntl_id), 0, 0, 0);
+            edd, drive_fl, 0xffffffff, EDD_PCI | EDD_SCSI
+            , edd_pci_path(GET_FLATPTR(drive_fl->cntl_id), 0), 0);
     default:
-        return fill_generic_edd(seg, param_far, drive_gf, 0, NULL, 0, 0, 0, 0);
+        return fill_generic_edd(edd, drive_fl, 0, 0, 0, 0);
     }
 }
 
 
 /****************************************************************
- * 16bit calling interface
+ * Disk driver dispatch
  ****************************************************************/
 
-int VISIBLE32FLAT
-process_scsi_op(struct disk_op_s *op)
+void
+block_setup(void)
+{
+    floppy_setup();
+    ata_setup();
+    ahci_setup();
+    sdcard_setup();
+    ramdisk_setup();
+    virtio_blk_setup();
+    virtio_scsi_setup();
+    lsi_scsi_setup();
+    esp_scsi_setup();
+    megasas_setup();
+    pvscsi_setup();
+    mpt_scsi_setup();
+    nvme_setup();
+}
+
+// Fallback handler for command requests not implemented by drivers
+int
+default_process_op(struct disk_op_s *op)
 {
     switch (op->command) {
-    case CMD_READ:
-        return cdb_read(op);
-    case CMD_WRITE:
-        return cdb_write(op);
     case CMD_FORMAT:
     case CMD_RESET:
     case CMD_ISREADY:
     case CMD_VERIFY:
     case CMD_SEEK:
+        // Return success if the driver doesn't implement these commands
         return DISK_RET_SUCCESS;
     default:
         return DISK_RET_EPARAM;
     }
 }
 
-int VISIBLE32FLAT
-process_atapi_op(struct disk_op_s *op)
+// Command dispatch for disk drivers that run in both 16bit and 32bit mode
+static int
+process_op_both(struct disk_op_s *op)
 {
-    switch (op->command) {
-    case CMD_WRITE:
-    case CMD_FORMAT:
-        return DISK_RET_EWRITEPROTECT;
+    switch (GET_FLATPTR(op->drive_fl->type)) {
+    case DTYPE_ATA_ATAPI:
+        return ata_atapi_process_op(op);
+    case DTYPE_USB:
+        return usb_process_op(op);
+    case DTYPE_UAS:
+        return uas_process_op(op);
+    case DTYPE_LSI_SCSI:
+        return lsi_scsi_process_op(op);
+    case DTYPE_ESP_SCSI:
+        return esp_scsi_process_op(op);
+    case DTYPE_MEGASAS:
+        return megasas_process_op(op);
+    case DTYPE_MPT_SCSI:
+        return mpt_scsi_process_op(op);
     default:
-        return process_scsi_op(op);
+        if (!MODESEGMENT)
+            return DISK_RET_EPARAM;
+        // In 16bit mode and driver not found - try in 32bit mode
+        return call32(process_op_32, MAKE_FLATPTR(GET_SEG(SS), op)
+                      , DISK_RET_EPARAM);
     }
 }
 
-// Execute a disk_op request.
+// Command dispatch for disk drivers that only run in 32bit mode
+int VISIBLE32FLAT
+process_op_32(struct disk_op_s *op)
+{
+    ASSERT32FLAT();
+    switch (op->drive_fl->type) {
+    case DTYPE_VIRTIO_BLK:
+        return virtio_blk_process_op(op);
+    case DTYPE_AHCI:
+        return ahci_process_op(op);
+    case DTYPE_AHCI_ATAPI:
+        return ahci_atapi_process_op(op);
+    case DTYPE_SDCARD:
+        return sdcard_process_op(op);
+    case DTYPE_USB_32:
+        return usb_process_op(op);
+    case DTYPE_UAS_32:
+        return uas_process_op(op);
+    case DTYPE_VIRTIO_SCSI:
+        return virtio_scsi_process_op(op);
+    case DTYPE_PVSCSI:
+        return pvscsi_process_op(op);
+    case DTYPE_NVME:
+        return nvme_process_op(op);
+    default:
+        return process_op_both(op);
+    }
+}
+
+// Command dispatch for disk drivers that only run in 16bit mode
+static int
+process_op_16(struct disk_op_s *op)
+{
+    ASSERT16();
+    switch (GET_FLATPTR(op->drive_fl->type)) {
+    case DTYPE_FLOPPY:
+        return floppy_process_op(op);
+    case DTYPE_ATA:
+        return ata_process_op(op);
+    case DTYPE_RAMDISK:
+        return ramdisk_process_op(op);
+    case DTYPE_CDEMU:
+        return cdemu_process_op(op);
+    default:
+        return process_op_both(op);
+    }
+}
+
+// Execute a disk_op_s request.
 int
 process_op(struct disk_op_s *op)
 {
-    ASSERT16();
-    u8 type = GET_GLOBALFLAT(op->drive_gf->type);
-    switch (type) {
-    case DTYPE_FLOPPY:
-        return process_floppy_op(op);
-    case DTYPE_ATA:
-        return process_ata_op(op);
-    case DTYPE_RAMDISK:
-        return process_ramdisk_op(op);
-    case DTYPE_CDEMU:
-        return process_cdemu_op(op);
-    case DTYPE_VIRTIO_BLK:
-        return process_virtio_blk_op(op);
-    case DTYPE_AHCI: ;
-        extern void _cfunc32flat_process_ahci_op(void);
-        return call32(_cfunc32flat_process_ahci_op
-                      , (u32)MAKE_FLATPTR(GET_SEG(SS), op), DISK_RET_EPARAM);
-    case DTYPE_ATA_ATAPI:
-        return process_atapi_op(op);
-    case DTYPE_AHCI_ATAPI: ;
-        extern void _cfunc32flat_process_atapi_op(void);
-        return call32(_cfunc32flat_process_atapi_op
-                      , (u32)MAKE_FLATPTR(GET_SEG(SS), op), DISK_RET_EPARAM);
-    case DTYPE_USB:
-    case DTYPE_UAS:
-    case DTYPE_VIRTIO_SCSI:
-    case DTYPE_LSI_SCSI:
-    case DTYPE_ESP_SCSI:
-    case DTYPE_MEGASAS:
-        return process_scsi_op(op);
-    case DTYPE_USB_32:
-    case DTYPE_UAS_32:
-    case DTYPE_PVSCSI: ;
-        extern void _cfunc32flat_process_scsi_op(void);
-        return call32(_cfunc32flat_process_scsi_op
-                     , (u32)MAKE_FLATPTR(GET_SEG(SS), op), DISK_RET_EPARAM);
-    case DTYPE_SD: ;
-        extern void _cfunc32flat_process_sd_op(void);
-        return call32(_cfunc32flat_process_sd_op
-                      , (u32)MAKE_FLATPTR(GET_SEG(SS), op), DISK_RET_EPARAM);
-    default:
-        op->count = 0;
-        return DISK_RET_EPARAM;
-    }
-}
-
-// Execute a "disk_op_s" request - this runs on the extra stack.
-static int
-__send_disk_op(struct disk_op_s *op_far, u16 op_seg)
-{
-    struct disk_op_s dop;
-    memcpy_far(GET_SEG(SS), &dop
-               , op_seg, op_far
-               , sizeof(dop));
-
     dprintf(DEBUG_HDL_13, "disk_op d=%p lba=%d buf=%p count=%d cmd=%d\n"
-            , dop.drive_gf, (u32)dop.lba, dop.buf_fl
-            , dop.count, dop.command);
+            , op->drive_fl, (u32)op->lba, op->buf_fl
+            , op->count, op->command);
 
-    int status = process_op(&dop);
-
-    // Update count with total sectors transferred.
-    SET_FARVAR(op_seg, op_far->count, dop.count);
-
-    return status;
-}
-
-// Execute a "disk_op_s" request by jumping to the extra 16bit stack.
-int
-send_disk_op(struct disk_op_s *op)
-{
-    ASSERT16();
-    if (! CONFIG_DRIVES)
-        return -1;
-
-    return stack_hop((u32)op, GET_SEG(SS), __send_disk_op);
+    int ret, origcount = op->count;
+    if (origcount * GET_FLATPTR(op->drive_fl->blksize) > 64*1024) {
+        op->count = 0;
+        return DISK_RET_EBOUNDARY;
+    }
+    if (MODESEGMENT)
+        ret = process_op_16(op);
+    else
+        ret = process_op_32(op);
+    if (ret && op->count == origcount)
+        // If the count hasn't changed on error, assume no data transferred.
+        op->count = 0;
+    return ret;
 }

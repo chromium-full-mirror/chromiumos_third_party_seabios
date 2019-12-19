@@ -11,7 +11,7 @@
 #include "config.h" // CONFIG_FLOPPY
 #include "malloc.h" // malloc_fseg
 #include "output.h" // dprintf
-#include "pci.h" // pci_to_bdf
+#include "pcidevice.h" // pci_find_class
 #include "pci_ids.h" // PCI_CLASS_BRIDGE_ISA
 #include "pic.h" // pic_eoi1
 #include "romfile.h" // romfile_loadint
@@ -34,6 +34,19 @@
 #define FLOPPY_GAPLEN 0x1B
 #define FLOPPY_FORMAT_GAPLEN 0x6c
 #define FLOPPY_PIO_TIMEOUT 1000
+#define FLOPPY_IRQ_TIMEOUT 5000
+#define FLOPPY_SPECIFY1 0xAF  // step rate 12ms, head unload 240ms
+#define FLOPPY_SPECIFY2 0x02  // head load time 4ms, DMA used
+#define FLOPPY_STARTUP_TIME 8 // 1 second
+
+#define FLOPPY_DOR_MOTOR_D     0x80 // Set to turn drive 3's motor ON
+#define FLOPPY_DOR_MOTOR_C     0x40 // Set to turn drive 2's motor ON
+#define FLOPPY_DOR_MOTOR_B     0x20 // Set to turn drive 1's motor ON
+#define FLOPPY_DOR_MOTOR_A     0x10 // Set to turn drive 0's motor ON
+#define FLOPPY_DOR_MOTOR_MASK  0xf0
+#define FLOPPY_DOR_IRQ         0x08 // Set to enable IRQs and DMA
+#define FLOPPY_DOR_RESET       0x04 // Clear = enter reset mode, Set = normal operation
+#define FLOPPY_DOR_DSEL_MASK   0x03 // "Select" drive number for next access
 
 // New diskette parameter table adding 3 parameters from IBM
 // Since no provisions are made for multiple drive types, most
@@ -41,8 +54,8 @@
 // floppy here
 struct floppy_ext_dbt_s diskette_param_table2 VARFSEG = {
     .dbt = {
-        .specify1       = 0xAF, // step rate 12ms, head unload 240ms
-        .specify2       = 0x02, // head load time 4ms, DMA used
+        .specify1       = FLOPPY_SPECIFY1,
+        .specify2       = FLOPPY_SPECIFY2,
         .shutoff_ticks  = FLOPPY_MOTOR_TICKS, // ~2 seconds
         .bps_code       = FLOPPY_SIZE_CODE,
         .sectors        = 18,
@@ -51,7 +64,7 @@ struct floppy_ext_dbt_s diskette_param_table2 VARFSEG = {
         .gap_len        = FLOPPY_FORMAT_GAPLEN,
         .fill_byte      = FLOPPY_FILLBYTE,
         .settle_time    = 0x0F, // 15ms
-        .startup_time   = 0x08, // 1 second
+        .startup_time   = FLOPPY_STARTUP_TIME,
     },
     .max_track      = 79,   // maximum track
     .data_rate      = 0,    // data transfer rate
@@ -180,6 +193,12 @@ find_floppy_type(u32 size)
 
 u8 FloppyDOR VARLOW;
 
+static inline u8
+floppy_dor_read(void)
+{
+    return GET_LOW(FloppyDOR);
+}
+
 static inline void
 floppy_dor_write(u8 val)
 {
@@ -187,11 +206,18 @@ floppy_dor_write(u8 val)
     SET_LOW(FloppyDOR, val);
 }
 
+static inline void
+floppy_dor_mask(u8 off, u8 on)
+{
+    floppy_dor_write((floppy_dor_read() & ~off) | on);
+}
+
 static void
 floppy_disable_controller(void)
 {
     dprintf(2, "Floppy_disable_controller\n");
-    floppy_dor_write(0x00);
+    // Clear the reset bit (enter reset state) and clear 'enable IRQ and DMA'
+    floppy_dor_mask(FLOPPY_DOR_IRQ | FLOPPY_DOR_RESET, 0);
 }
 
 static int
@@ -199,8 +225,9 @@ floppy_wait_irq(void)
 {
     u8 frs = GET_BDA(floppy_recalibration_status);
     SET_BDA(floppy_recalibration_status, frs & ~FRS_IRQ);
+    u32 end = timer_calc(FLOPPY_IRQ_TIMEOUT);
     for (;;) {
-        if (!GET_BDA(floppy_motor_counter)) {
+        if (timer_check(end)) {
             warn_timeout();
             floppy_disable_controller();
             return DISK_RET_ETIMEOUT;
@@ -226,6 +253,7 @@ floppy_wait_irq(void)
 #define FC_READ        (0xe6 | (8<<8) | (7<<12) | FCF_WAITIRQ)
 #define FC_WRITE       (0xc5 | (8<<8) | (7<<12) | FCF_WAITIRQ)
 #define FC_FORMAT      (0x4d | (5<<8) | (7<<12) | FCF_WAITIRQ)
+#define FC_SPECIFY     (0x03 | (2<<8) | (0<<12))
 
 // Send the specified command and it's parameters to the floppy controller.
 static int
@@ -244,6 +272,7 @@ floppy_pio(int command, u8 *param)
                 floppy_disable_controller();
                 return DISK_RET_ETIMEOUT;
             }
+            yield();
             continue;
         }
         if (sts & 0x40) {
@@ -277,6 +306,7 @@ floppy_pio(int command, u8 *param)
                 floppy_disable_controller();
                 return DISK_RET_ETIMEOUT;
             }
+            yield();
             continue;
         }
         if (i >= receive) {
@@ -300,15 +330,31 @@ static int
 floppy_enable_controller(void)
 {
     dprintf(2, "Floppy_enable_controller\n");
-    SET_BDA(floppy_motor_counter, FLOPPY_MOTOR_TICKS);
-    floppy_dor_write(0x00);
-    floppy_dor_write(0x0c);
+    // Clear the reset bit (enter reset state), but set 'enable IRQ and DMA'
+    floppy_dor_mask(FLOPPY_DOR_RESET, FLOPPY_DOR_IRQ);
+    // Real hardware needs a 4 microsecond delay
+    usleep(4);
+    // Set the reset bit (normal operation) and keep 'enable IRQ and DMA' on
+    floppy_dor_mask(0, FLOPPY_DOR_IRQ | FLOPPY_DOR_RESET);
     int ret = floppy_wait_irq();
     if (ret)
         return ret;
 
+    // After the interrupt is received, send 4 SENSE INTERRUPT commands to
+    // clear the interrupt status for each of the four logical drives,
+    // supported by the controller.
+    // See section 7.4 - "Drive Polling" of the Intel 82077AA datasheet for
+    // a more detailed description of why this voodoo needs to be done.
+    // Without this, initialization fails on real controllers (but still works
+    // in QEMU)
     u8 param[2];
-    return floppy_pio(FC_CHECKIRQ, param);
+    int i;
+    for (i=0; i<4; i++) {
+        ret = floppy_pio(FC_CHECKIRQ, param);
+        if (ret)
+            return ret;
+    }
+    return DISK_RET_SUCCESS;
 }
 
 // Activate a drive and send a command to it.
@@ -316,20 +362,29 @@ static int
 floppy_drive_pio(u8 floppyid, int command, u8 *param)
 {
     // Enable controller if it isn't running.
-    if (!(GET_LOW(FloppyDOR) & 0x04)) {
+    if (!(floppy_dor_read() & FLOPPY_DOR_RESET)) {
         int ret = floppy_enable_controller();
         if (ret)
             return ret;
     }
 
-    // reset the disk motor timeout value of INT 08
-    SET_BDA(floppy_motor_counter, FLOPPY_MOTOR_TICKS);
+    // set the disk motor timeout value of INT 08 to the highest value
+    SET_BDA(floppy_motor_counter, 255);
+
+    // Check if the motor is already running
+    u8 motor_mask = FLOPPY_DOR_MOTOR_A << floppyid;
+    int motor_already_running = floppy_dor_read() & motor_mask;
 
     // Turn on motor of selected drive, DMA & int enabled, normal operation
-    floppy_dor_write((floppyid ? 0x20 : 0x10) | 0x0c | floppyid);
+    floppy_dor_write(motor_mask | FLOPPY_DOR_IRQ | FLOPPY_DOR_RESET | floppyid);
+
+    // If the motor was just started, wait for it to get up to speed
+    if (!motor_already_running && !CONFIG_QEMU)
+        msleep(FLOPPY_STARTUP_TIME * 125);
 
     // Send command.
     int ret = floppy_pio(command, param);
+    SET_BDA(floppy_motor_counter, FLOPPY_MOTOR_TICKS); // reset motor timeout
     if (ret)
         return ret;
 
@@ -359,6 +414,15 @@ floppy_drive_recal(u8 floppyid)
     SET_BDA(floppy_recalibration_status, frs | (1<<floppyid));
     SET_BDA(floppy_track[floppyid], 0);
     return DISK_RET_SUCCESS;
+}
+
+static int
+floppy_drive_specify(void)
+{
+    u8 param[2];
+    param[0] = FLOPPY_SPECIFY1;
+    param[1] = FLOPPY_SPECIFY2;
+    return floppy_pio(FC_SPECIFY, param);
 }
 
 static int
@@ -438,6 +502,12 @@ floppy_prep(struct drive_s *drive_gf, u8 cylinder)
         ret = floppy_media_sense(drive_gf);
         if (ret)
             return ret;
+
+        // Execute a SPECIFY command (sets the Step Rate Time,
+        // Head Load Time, Head Unload Time and the DMA enable/disable bit).
+        ret = floppy_drive_specify();
+        if (ret)
+            return ret;
     }
 
     // Seek to cylinder if needed.
@@ -471,7 +541,7 @@ floppy_dma_cmd(struct disk_op_s *op, int count, int command, u8 *param)
         return DISK_RET_EBOUNDARY;
 
     // Invoke floppy controller
-    u8 floppyid = GET_GLOBALFLAT(op->drive_gf->cntl_id);
+    u8 floppyid = GET_GLOBALFLAT(op->drive_fl->cntl_id);
     ret = floppy_drive_pio(floppyid, command, param);
     if (ret)
         return ret;
@@ -504,11 +574,11 @@ lba2chs(struct disk_op_s *op)
     struct chs_s res = { };
 
     u32 tmp = op->lba;
-    u16 nls = GET_GLOBALFLAT(op->drive_gf->lchs.sector);
+    u16 nls = GET_GLOBALFLAT(op->drive_fl->lchs.sector);
     res.sector = (tmp % nls) + 1;
 
     tmp /= nls;
-    u16 nlh = GET_GLOBALFLAT(op->drive_gf->lchs.head);
+    u16 nlh = GET_GLOBALFLAT(op->drive_fl->lchs.head);
     res.head = tmp % nlh;
 
     tmp /= nlh;
@@ -536,12 +606,12 @@ static int
 floppy_read(struct disk_op_s *op)
 {
     struct chs_s chs = lba2chs(op);
-    int ret = floppy_prep(op->drive_gf, chs.cylinder);
+    int ret = floppy_prep(op->drive_fl, chs.cylinder);
     if (ret)
         return ret;
 
     // send read-normal-data command to controller
-    u8 floppyid = GET_GLOBALFLAT(op->drive_gf->cntl_id);
+    u8 floppyid = GET_GLOBALFLAT(op->drive_fl->cntl_id);
     u8 param[8];
     param[0] = (chs.head << 2) | floppyid; // HD DR1 DR2
     param[1] = chs.cylinder;
@@ -559,12 +629,12 @@ static int
 floppy_write(struct disk_op_s *op)
 {
     struct chs_s chs = lba2chs(op);
-    int ret = floppy_prep(op->drive_gf, chs.cylinder);
+    int ret = floppy_prep(op->drive_fl, chs.cylinder);
     if (ret)
         return ret;
 
     // send write-normal-data command to controller
-    u8 floppyid = GET_GLOBALFLAT(op->drive_gf->cntl_id);
+    u8 floppyid = GET_GLOBALFLAT(op->drive_fl->cntl_id);
     u8 param[8];
     param[0] = (chs.head << 2) | floppyid; // HD DR1 DR2
     param[1] = chs.cylinder;
@@ -582,7 +652,7 @@ static int
 floppy_verify(struct disk_op_s *op)
 {
     struct chs_s chs = lba2chs(op);
-    int ret = floppy_prep(op->drive_gf, chs.cylinder);
+    int ret = floppy_prep(op->drive_fl, chs.cylinder);
     if (ret)
         return ret;
 
@@ -595,12 +665,12 @@ static int
 floppy_format(struct disk_op_s *op)
 {
     struct chs_s chs = lba2chs(op);
-    int ret = floppy_prep(op->drive_gf, chs.cylinder);
+    int ret = floppy_prep(op->drive_fl, chs.cylinder);
     if (ret)
         return ret;
 
     // send format-track command to controller
-    u8 floppyid = GET_GLOBALFLAT(op->drive_gf->cntl_id);
+    u8 floppyid = GET_GLOBALFLAT(op->drive_fl->cntl_id);
     u8 param[7];
     param[0] = (chs.head << 2) | floppyid; // HD DR1 DR2
     param[1] = FLOPPY_SIZE_CODE;
@@ -611,7 +681,7 @@ floppy_format(struct disk_op_s *op)
 }
 
 int
-process_floppy_op(struct disk_op_s *op)
+floppy_process_op(struct disk_op_s *op)
 {
     if (!CONFIG_FLOPPY)
         return 0;
@@ -666,6 +736,6 @@ floppy_tick(void)
         SET_BDA(floppy_motor_counter, fcount);
         if (fcount == 0)
             // turn motor(s) off
-            floppy_dor_write(GET_LOW(FloppyDOR) & ~0xf0);
+            floppy_dor_mask(FLOPPY_DOR_MOTOR_MASK, 0);
     }
 }

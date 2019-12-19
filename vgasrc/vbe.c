@@ -12,13 +12,20 @@
 #include "output.h" // dprintf
 #include "std/vbe.h" // struct vbe_info
 #include "string.h" // memset_far
-#include "vgabios.h" // handle_104f
+#include "vgabios.h" // get_current_mode
 #include "vgahw.h" // vgahw_set_mode
+#include "vgautil.h" // handle_104f
+
+#define VBE_OEM_STRING "SeaBIOS VBE(C) 2011"
+#define VBE_VENDOR_STRING "SeaBIOS Developers"
+#define VBE_PRODUCT_STRING "SeaBIOS VBE Adapter"
+#define VBE_REVISION_STRING "Rev. 1"
 
 u32 VBE_total_memory VAR16 = 256 * 1024;
 u32 VBE_capabilities VAR16;
 u32 VBE_framebuffer VAR16;
 u16 VBE_win_granularity VAR16;
+u8 VBE_edid[256] VAR16;
 
 static void
 vbe_104f00(struct bregs *regs)
@@ -101,7 +108,7 @@ vbe_104f01(struct bregs *regs)
     // Basic information about mode.
     int width = GET_GLOBAL(vmode_g->width);
     int height = GET_GLOBAL(vmode_g->height);
-    int linesize = DIV_ROUND_UP(width * vga_bpp(vmode_g), 8);
+    int linesize = vgahw_get_linesize(vmode_g);
     SET_FARVAR(seg, info->bytes_per_scanline, linesize);
     SET_FARVAR(seg, info->xres, width);
     SET_FARVAR(seg, info->yres, height);
@@ -395,6 +402,34 @@ vbe_104f10(struct bregs *regs)
 }
 
 static void
+vbe_104f15(struct bregs *regs)
+{
+    int offset;
+
+    switch (regs->bl) {
+    case 0x00:
+        if (GET_GLOBAL(VBE_edid[0]) != 0x00 ||
+            GET_GLOBAL(VBE_edid[1]) != 0xff)
+            goto err;
+        regs->bx = 0x0103;
+        break;
+    case 0x01:
+        offset = regs->dx * 128;
+        if (offset >= sizeof(VBE_edid))
+            goto err;
+        memcpy_far(regs->es, (void*)(regs->di+0),
+                   get_global_seg(), VBE_edid + offset,
+                   128);
+        break;
+    err:
+    default:
+        regs->ax = 0x014f;
+        return;
+    }
+    regs->ax = 0x004f;
+}
+
+static void
 vbe_104fXX(struct bregs *regs)
 {
     debug_stub(regs);
@@ -421,6 +456,7 @@ handle_104f(struct bregs *regs)
     case 0x08: vbe_104f08(regs); break;
     case 0x0a: vbe_104f0a(regs); break;
     case 0x10: vbe_104f10(regs); break;
+    case 0x15: vbe_104f15(regs); break;
     default:   vbe_104fXX(regs); break;
     }
 }

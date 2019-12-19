@@ -96,7 +96,7 @@ savedefconfig: $(obj)/conf
 
 defconfig: $(obj)/conf
 	@echo "  Build default config"
-	$(Q)$< --defconfig=$(KCONFIG_DEFCONFIG) $(Kconfig)
+	$(Q)$< --defconfig=/dev/null $(Kconfig)
 
 %_defconfig: $(obj)/conf
 	$(Q)$< --defconfig=arch/$(SRCARCH)/configs/$@ $(Kconfig)

@@ -10,7 +10,8 @@
 #include "blockcmd.h" // CDB_CMD_READ_10
 #include "malloc.h" // free
 #include "output.h" // dprintf
-#include "pci.h" // foreachpci
+#include "pci.h" // pci_config_readb
+#include "pcidevice.h" // foreachpci
 #include "pci_ids.h" // PCI_CLASS_STORAGE_OTHER
 #include "pci_regs.h" // PCI_INTERRUPT_LINE
 #include "stacks.h" // yield
@@ -71,14 +72,12 @@ static void sata_prep_atapi(struct sata_cmd_fis *fis, u16 blocksize)
 // ahci register access helpers
 static u32 ahci_ctrl_readl(struct ahci_ctrl_s *ctrl, u32 reg)
 {
-    u32 addr = ctrl->iobase + reg;
-    return readl((void*)addr);
+    return readl(ctrl->iobase + reg);
 }
 
 static void ahci_ctrl_writel(struct ahci_ctrl_s *ctrl, u32 reg, u32 val)
 {
-    u32 addr = ctrl->iobase + reg;
-    writel((void*)addr, val);
+    writel(ctrl->iobase + reg, val);
 }
 
 static u32 ahci_port_to_ctrl(u32 pnr, u32 port_reg)
@@ -131,7 +130,6 @@ static int ahci_command(struct ahci_port_s *port_gf, int iswrite, int isatapi,
     intbits = ahci_port_readl(ctrl, pnr, PORT_IRQ_STAT);
     if (intbits)
         ahci_port_writel(ctrl, pnr, PORT_IRQ_STAT, intbits);
-    ahci_port_writel(ctrl, pnr, PORT_SCR_ACT, 1);
     ahci_port_writel(ctrl, pnr, PORT_CMD_ISSUE, 1);
 
     u32 end = timer_calc(AHCI_REQUEST_TIMEOUT);
@@ -213,23 +211,22 @@ static int ahci_command(struct ahci_port_s *port_gf, int iswrite, int isatapi,
 
 #define CDROM_CDB_SIZE 12
 
-int ahci_cmd_data(struct disk_op_s *op, void *cdbcmd, u16 blocksize)
+int ahci_atapi_process_op(struct disk_op_s *op)
 {
     if (! CONFIG_AHCI)
         return 0;
 
     struct ahci_port_s *port_gf = container_of(
-        op->drive_gf, struct ahci_port_s, drive);
+        op->drive_fl, struct ahci_port_s, drive);
     struct ahci_cmd_s *cmd = port_gf->cmd;
-    u8 *atapi = cdbcmd;
-    int i, rc;
 
+    if (op->command == CMD_WRITE || op->command == CMD_FORMAT)
+        return DISK_RET_EWRITEPROTECT;
+    int blocksize = scsi_fill_cmd(op, cmd->atapi, CDROM_CDB_SIZE);
+    if (blocksize < 0)
+        return default_process_op(op);
     sata_prep_atapi(&cmd->fis, blocksize);
-    for (i = 0; i < CDROM_CDB_SIZE; i++) {
-        cmd->atapi[i] = atapi[i];
-    }
-    rc = ahci_command(port_gf, 0, 1, op->buf_fl,
-                      op->count * blocksize);
+    int rc = ahci_command(port_gf, 0, 1, op->buf_fl, op->count * blocksize);
     if (rc < 0)
         return DISK_RET_EBADTRACK;
     return DISK_RET_SUCCESS;
@@ -240,7 +237,7 @@ static int
 ahci_disk_readwrite_aligned(struct disk_op_s *op, int iswrite)
 {
     struct ahci_port_s *port_gf = container_of(
-        op->drive_gf, struct ahci_port_s, drive);
+        op->drive_fl, struct ahci_port_s, drive);
     struct ahci_cmd_s *cmd = port_gf->cmd;
     int rc;
 
@@ -296,8 +293,8 @@ ahci_disk_readwrite(struct disk_op_s *op, int iswrite)
 }
 
 // command demuxer
-int VISIBLE32FLAT
-process_ahci_op(struct disk_op_s *op)
+int
+ahci_process_op(struct disk_op_s *op)
 {
     if (!CONFIG_AHCI)
         return 0;
@@ -306,15 +303,8 @@ process_ahci_op(struct disk_op_s *op)
         return ahci_disk_readwrite(op, 0);
     case CMD_WRITE:
         return ahci_disk_readwrite(op, 1);
-    case CMD_FORMAT:
-    case CMD_RESET:
-    case CMD_ISREADY:
-    case CMD_VERIFY:
-    case CMD_SEEK:
-        return DISK_RET_SUCCESS;
     default:
-        dprintf(1, "AHCI: unknown disk command %d\n", op->command);
-        return DISK_RET_EPARAM;
+        return default_process_op(op);
     }
 }
 
@@ -355,6 +345,7 @@ ahci_port_alloc(struct ahci_ctrl_s *ctrl, u32 pnr)
         warn_noalloc();
         return NULL;
     }
+    memset(port, 0, sizeof(*port));
     port->pnr = pnr;
     port->ctrl = ctrl;
     port->list = memalign_tmp(1024, 1024);
@@ -370,6 +361,11 @@ ahci_port_alloc(struct ahci_ctrl_s *ctrl, u32 pnr)
 
     ahci_port_writel(ctrl, pnr, PORT_LST_ADDR, (u32)port->list);
     ahci_port_writel(ctrl, pnr, PORT_FIS_ADDR, (u32)port->fis);
+    if (ctrl->caps & HOST_CAP_64) {
+        ahci_port_writel(ctrl, pnr, PORT_LST_ADDR_HI, 0);
+        ahci_port_writel(ctrl, pnr, PORT_FIS_ADDR_HI, 0);
+    }
+
     return port;
 }
 
@@ -405,6 +401,14 @@ static struct ahci_port_s* ahci_port_realloc(struct ahci_port_s *port)
     port->list = memalign_high(1024, 1024);
     port->fis = memalign_high(256, 256);
     port->cmd = memalign_high(256, 256);
+    if (!port->list || !port->fis || !port->cmd) {
+        warn_noalloc();
+        free(port->list);
+        free(port->fis);
+        free(port->cmd);
+        free(port);
+        return NULL;
+    }
 
     ahci_port_writel(port->ctrl, port->pnr, PORT_LST_ADDR, (u32)port->list);
     ahci_port_writel(port->ctrl, port->pnr, PORT_FIS_ADDR, (u32)port->fis);
@@ -516,6 +520,63 @@ static int ahci_port_setup(struct ahci_port_s *port)
                               , ata_extract_version(buffer)
                               , (u32)adjsize, adjprefix);
         port->prio = bootprio_find_ata_device(ctrl->pci_tmp, pnr, 0);
+
+        s8 multi_dma = -1;
+        s8 pio_mode = -1;
+        s8 udma_mode = -1;
+        // If bit 2 in word 53 is set, udma information is valid in word 88.
+        if (buffer[53] & 0x04) {
+            udma_mode = 6;
+            while ((udma_mode >= 0) &&
+                   !((buffer[88] & 0x7f) & ( 1 << udma_mode ))) {
+                udma_mode--;
+            }
+        }
+        // If bit 1 in word 53 is set, multiword-dma and advanced pio modes
+        // are available in words 63 and 64.
+        if (buffer[53] & 0x02) {
+            pio_mode = 4;
+            multi_dma = 3;
+            while ((multi_dma >= 0) &&
+                   !((buffer[63] & 0x7) & ( 1 << multi_dma ))) {
+                multi_dma--;
+            }
+            while ((pio_mode >= 3) &&
+                   !((buffer[64] & 0x3) & ( 1 << ( pio_mode - 3 ) ))) {
+                pio_mode--;
+            }
+        }
+        dprintf(2, "AHCI/%d: supported modes: udma %d, multi-dma %d, pio %d\n",
+                port->pnr, udma_mode, multi_dma, pio_mode);
+
+        sata_prep_simple(&port->cmd->fis, ATA_CMD_SET_FEATURES);
+        port->cmd->fis.feature = ATA_SET_FEATRUE_TRANSFER_MODE;
+        // Select used mode. UDMA first, then Multi-DMA followed by
+        // advanced PIO modes 3 or 4. If non, set default PIO.
+        if (udma_mode >= 0) {
+            dprintf(1, "AHCI/%d: Set transfer mode to UDMA-%d\n",
+                    port->pnr, udma_mode);
+            port->cmd->fis.sector_count = ATA_TRANSFER_MODE_ULTRA_DMA
+                                          | udma_mode;
+        } else if (multi_dma >= 0) {
+            dprintf(1, "AHCI/%d: Set transfer mode to Multi-DMA-%d\n",
+                    port->pnr, multi_dma);
+            port->cmd->fis.sector_count = ATA_TRANSFER_MODE_MULTIWORD_DMA
+                                          | multi_dma;
+        } else if (pio_mode >= 3) {
+            dprintf(1, "AHCI/%d: Set transfer mode to PIO-%d\n",
+                    port->pnr, pio_mode);
+            port->cmd->fis.sector_count = ATA_TRANSFER_MODE_PIO_FLOW_CTRL
+                                          | pio_mode;
+        } else {
+            dprintf(1, "AHCI/%d: Set transfer mode to default PIO\n",
+                    port->pnr);
+            port->cmd->fis.sector_count = ATA_TRANSFER_MODE_DEFAULT_PIO;
+        }
+        rc = ahci_command(port, 1, 0, 0, 0);
+        if (rc < 0) {
+            dprintf(1, "AHCI/%d: Set transfer mode failed.\n", port->pnr);
+        }
     } else {
         // found cdrom (atapi)
         port->drive.type = DTYPE_AHCI_ATAPI;
@@ -533,6 +594,7 @@ static int ahci_port_setup(struct ahci_port_s *port)
                               , ata_extract_version(buffer));
         port->prio = bootprio_find_ata_device(ctrl->pci_tmp, pnr, 0);
     }
+    boot_lchs_find_ata_device(ctrl->pci_tmp, pnr, 0, &(port->drive.lchs));
     return 0;
 }
 
@@ -567,31 +629,29 @@ ahci_port_detect(void *data)
 static void
 ahci_controller_setup(struct pci_device *pci)
 {
-    struct ahci_ctrl_s *ctrl = malloc_fseg(sizeof(*ctrl));
     struct ahci_port_s *port;
-    u16 bdf = pci->bdf;
     u32 val, pnr, max;
 
+    if (create_bounce_buf() < 0)
+        return;
+
+    void *iobase = pci_enable_membar(pci, PCI_BASE_ADDRESS_5);
+    if (!iobase)
+        return;
+
+    struct ahci_ctrl_s *ctrl = malloc_fseg(sizeof(*ctrl));
     if (!ctrl) {
         warn_noalloc();
         return;
     }
 
-    if (create_bounce_buf() < 0) {
-        warn_noalloc();
-        free(ctrl);
-        return;
-    }
-
     ctrl->pci_tmp = pci;
-    ctrl->pci_bdf = bdf;
-    ctrl->iobase = pci_config_readl(bdf, PCI_BASE_ADDRESS_5);
-    ctrl->irq = pci_config_readb(bdf, PCI_INTERRUPT_LINE);
-    dprintf(1, "AHCI controller at %02x.%x, iobase %x, irq %d\n",
-            bdf >> 3, bdf & 7, ctrl->iobase, ctrl->irq);
+    ctrl->iobase = iobase;
+    ctrl->irq = pci_config_readb(pci->bdf, PCI_INTERRUPT_LINE);
+    dprintf(1, "AHCI controller at %pP, iobase %p, irq %d\n"
+            , pci, ctrl->iobase, ctrl->irq);
 
-    pci_config_maskw(bdf, PCI_COMMAND, 0,
-                     PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+    pci_enable_busmaster(pci);
 
     val = ahci_ctrl_readl(ctrl, HOST_CTL);
     ahci_ctrl_writel(ctrl, HOST_CTL, val | HOST_CTL_AHCI_EN);
@@ -601,7 +661,7 @@ ahci_controller_setup(struct pci_device *pci)
     dprintf(2, "AHCI: cap 0x%x, ports_impl 0x%x\n",
             ctrl->caps, ctrl->ports);
 
-    max = ctrl->caps & 0x1f;
+    max = 0x1f;
     for (pnr = 0; pnr <= max; pnr++) {
         if (!(ctrl->ports & (1 << pnr)))
             continue;

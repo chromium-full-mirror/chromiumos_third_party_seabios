@@ -8,11 +8,13 @@
 #include "config.h" // CONFIG_*
 #include "malloc.h" // free
 #include "output.h" // dprintf
-#include "pci.h" // pci_bdf_to_bus
+#include "pci.h" // pci_config_writew
+#include "pcidevice.h" // foreachpci
 #include "pci_ids.h" // PCI_CLASS_SERIAL_USB_UHCI
 #include "pci_regs.h" // PCI_BASE_ADDRESS_4
 #include "string.h" // memset
 #include "usb.h" // struct usb_s
+#include "usb-ehci.h" // ehci_wait_controllers
 #include "usb-uhci.h" // USBLEGSUP
 #include "util.h" // msleep
 #include "x86.h" // outw
@@ -94,6 +96,9 @@ static int
 check_uhci_ports(struct usb_uhci_s *cntl)
 {
     ASSERT32FLAT();
+    // Wait for ehci init - in case this is a "companion controller"
+    ehci_wait_controllers();
+
     struct usbhub_s hub;
     memset(&hub, 0, sizeof(hub));
     hub.cntl = &cntl->usb;
@@ -240,26 +245,25 @@ fail:
 static void
 uhci_controller_setup(struct pci_device *pci)
 {
-    u16 bdf = pci->bdf;
+    u16 iobase = pci_enable_iobar(pci, PCI_BASE_ADDRESS_4);
+    if (!iobase)
+        return;
+
     struct usb_uhci_s *cntl = malloc_tmphigh(sizeof(*cntl));
     if (!cntl) {
         warn_noalloc();
         return;
     }
-    wait_preempt();  // Avoid pci_config_readl when preempting
     memset(cntl, 0, sizeof(*cntl));
     cntl->usb.pci = pci;
     cntl->usb.type = USB_TYPE_UHCI;
-    cntl->iobase = (pci_config_readl(bdf, PCI_BASE_ADDRESS_4)
-                    & PCI_BASE_ADDRESS_IO_MASK);
+    cntl->iobase = iobase;
 
-    dprintf(1, "UHCI init on dev %02x:%02x.%x (io=%x)\n"
-            , pci_bdf_to_bus(bdf), pci_bdf_to_dev(bdf)
-            , pci_bdf_to_fn(bdf), cntl->iobase);
+    dprintf(1, "UHCI init on dev %pP (io=%x)\n", pci, cntl->iobase);
 
-    pci_config_maskw(bdf, PCI_COMMAND, 0, PCI_COMMAND_MASTER);
+    pci_enable_busmaster(pci);
 
-    reset_uhci(cntl, bdf);
+    reset_uhci(cntl, pci->bdf);
 
     run_thread(configure_uhci, cntl);
 }
@@ -443,73 +447,17 @@ wait_td(struct uhci_td *td, u32 end)
     return 0;
 }
 
-int
-uhci_send_control(struct usb_pipe *p, int dir, const void *cmd, int cmdsize
-                  , void *data, int datasize)
-{
-    ASSERT32FLAT();
-    if (! CONFIG_USB_UHCI)
-        return -1;
-    dprintf(5, "uhci_control %p\n", p);
-    struct uhci_pipe *pipe = container_of(p, struct uhci_pipe, pipe);
-
-    int maxpacket = pipe->pipe.maxpacket;
-    int lowspeed = pipe->pipe.speed;
-    int devaddr = pipe->pipe.devaddr | (pipe->pipe.ep << 7);
-
-    // Setup transfer descriptors
-    int count = 2 + DIV_ROUND_UP(datasize, maxpacket);
-    struct uhci_td *tds = malloc_tmphigh(sizeof(*tds) * count);
-    if (!tds) {
-        warn_noalloc();
-        return -1;
-    }
-
-    tds[0].link = (u32)&tds[1] | UHCI_PTR_DEPTH;
-    tds[0].status = (uhci_maxerr(3) | (lowspeed ? TD_CTRL_LS : 0)
-                     | TD_CTRL_ACTIVE);
-    tds[0].token = (uhci_explen(cmdsize) | (devaddr << TD_TOKEN_DEVADDR_SHIFT)
-                    | USB_PID_SETUP);
-    tds[0].buffer = (void*)cmd;
-    int toggle = TD_TOKEN_TOGGLE;
-    int i;
-    for (i=1; i<count-1; i++) {
-        tds[i].link = (u32)&tds[i+1] | UHCI_PTR_DEPTH;
-        tds[i].status = (uhci_maxerr(3) | (lowspeed ? TD_CTRL_LS : 0)
-                         | TD_CTRL_ACTIVE);
-        int len = (i == count-2 ? (datasize - (i-1)*maxpacket) : maxpacket);
-        tds[i].token = (uhci_explen(len) | toggle
-                        | (devaddr << TD_TOKEN_DEVADDR_SHIFT)
-                        | (dir ? USB_PID_IN : USB_PID_OUT));
-        tds[i].buffer = data + (i-1) * maxpacket;
-        toggle ^= TD_TOKEN_TOGGLE;
-    }
-    tds[i].link = UHCI_PTR_TERM;
-    tds[i].status = (uhci_maxerr(0) | (lowspeed ? TD_CTRL_LS : 0)
-                     | TD_CTRL_ACTIVE);
-    tds[i].token = (uhci_explen(0) | TD_TOKEN_TOGGLE
-                    | (devaddr << TD_TOKEN_DEVADDR_SHIFT)
-                    | (dir ? USB_PID_OUT : USB_PID_IN));
-    tds[i].buffer = 0;
-
-    // Transfer data
-    barrier();
-    pipe->qh.element = (u32)&tds[0];
-    int ret = wait_pipe(pipe, timer_calc(usb_xfer_time(p, datasize)));
-    free(tds);
-    return ret;
-}
-
-#define STACKTDS 4
+#define STACKTDS 16
 #define TDALIGN 16
 
 int
-uhci_send_bulk(struct usb_pipe *p, int dir, void *data, int datasize)
+uhci_send_pipe(struct usb_pipe *p, int dir, const void *cmd
+               , void *data, int datasize)
 {
     if (! CONFIG_USB_UHCI)
         return -1;
     struct uhci_pipe *pipe = container_of(p, struct uhci_pipe, pipe);
-    dprintf(7, "uhci_send_bulk qh=%p dir=%d data=%p size=%d\n"
+    dprintf(7, "uhci_send_pipe qh=%p dir=%d data=%p size=%d\n"
             , &pipe->qh, dir, data, datasize);
     int maxpacket = GET_LOWFLAT(pipe->pipe.maxpacket);
     int lowspeed = GET_LOWFLAT(pipe->pipe.speed);
@@ -517,18 +465,33 @@ uhci_send_bulk(struct usb_pipe *p, int dir, void *data, int datasize)
                    | (GET_LOWFLAT(pipe->pipe.ep) << 7));
     int toggle = GET_LOWFLAT(pipe->toggle) ? TD_TOKEN_TOGGLE : 0;
 
-    // Allocate 4 tds on stack (16byte aligned)
+    // Allocate 16 tds on stack (16byte aligned)
     u8 tdsbuf[sizeof(struct uhci_td) * STACKTDS + TDALIGN - 1];
     struct uhci_td *tds = (void*)ALIGN((u32)tdsbuf, TDALIGN);
     memset(tds, 0, sizeof(*tds) * STACKTDS);
+    int tdpos = 0;
 
     // Enable tds
     u32 end = timer_calc(usb_xfer_time(p, datasize));
     barrier();
     SET_LOWFLAT(pipe->qh.element, (u32)MAKE_FLATPTR(GET_SEG(SS), tds));
 
-    int tdpos = 0;
+    // Setup transfer descriptors
+    if (cmd) {
+        // Send setup pid on control transfers
+        struct uhci_td *td = &tds[tdpos++ % STACKTDS];
+        u32 nexttd = (u32)MAKE_FLATPTR(GET_SEG(SS), &tds[tdpos % STACKTDS]);
+        td->link = nexttd | UHCI_PTR_DEPTH;
+        td->token = (uhci_explen(USB_CONTROL_SETUP_SIZE)
+                     | (devaddr << TD_TOKEN_DEVADDR_SHIFT) | USB_PID_SETUP);
+        td->buffer = (void*)cmd;
+        barrier();
+        td->status = (uhci_maxerr(3) | (lowspeed ? TD_CTRL_LS : 0)
+                      | TD_CTRL_ACTIVE);
+        toggle = TD_TOKEN_TOGGLE;
+    }
     while (datasize) {
+        // Send data pids
         struct uhci_td *td = &tds[tdpos++ % STACKTDS];
         int ret = wait_td(td, end);
         if (ret)
@@ -537,9 +500,9 @@ uhci_send_bulk(struct usb_pipe *p, int dir, void *data, int datasize)
         int transfer = datasize;
         if (transfer > maxpacket)
             transfer = maxpacket;
-        struct uhci_td *nexttd_fl = MAKE_FLATPTR(GET_SEG(SS)
-                                                 , &tds[tdpos % STACKTDS]);
-        td->link = (transfer==datasize ? UHCI_PTR_TERM : (u32)nexttd_fl);
+        u32 nexttd = (u32)MAKE_FLATPTR(GET_SEG(SS), &tds[tdpos % STACKTDS]);
+        td->link = ((transfer==datasize && !cmd)
+                    ? UHCI_PTR_TERM : (nexttd | UHCI_PTR_DEPTH));
         td->token = (uhci_explen(transfer) | toggle
                      | (devaddr << TD_TOKEN_DEVADDR_SHIFT)
                      | (dir ? USB_PID_IN : USB_PID_OUT));
@@ -551,6 +514,21 @@ uhci_send_bulk(struct usb_pipe *p, int dir, void *data, int datasize)
 
         data += transfer;
         datasize -= transfer;
+    }
+    if (cmd) {
+        // Send status pid on control transfers
+        struct uhci_td *td = &tds[tdpos++ % STACKTDS];
+        int ret = wait_td(td, end);
+        if (ret)
+            goto fail;
+        td->link = UHCI_PTR_TERM;
+        td->token = (uhci_explen(0) | TD_TOKEN_TOGGLE
+                     | (devaddr << TD_TOKEN_DEVADDR_SHIFT)
+                     | (dir ? USB_PID_OUT : USB_PID_IN));
+        td->buffer = 0;
+        barrier();
+        td->status = (uhci_maxerr(0) | (lowspeed ? TD_CTRL_LS : 0)
+                      | TD_CTRL_ACTIVE);
     }
     SET_LOWFLAT(pipe->toggle, !!toggle);
     return wait_pipe(pipe, end);

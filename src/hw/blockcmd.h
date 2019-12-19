@@ -100,19 +100,15 @@ struct cdbres_mode_sense_geom {
 } PACKED;
 
 // blockcmd.c
-int cdb_is_read(u8 *cdbcmd, u16 blocksize);
 struct disk_op_s;
-int cdb_get_inquiry(struct disk_op_s *op, struct cdbres_inquiry *data);
-int cdb_get_sense(struct disk_op_s *op, struct cdbres_request_sense *data);
-int cdb_test_unit_ready(struct disk_op_s *op);
-int cdb_read_capacity(struct disk_op_s *op, struct cdbres_read_capacity *data);
-int cdb_mode_sense_geom(struct disk_op_s *op, struct cdbres_mode_sense_geom *data);
-int cdb_inquiry(struct disk_op_s *op, struct cdbres_inquiry *data);
-int cdb_read(struct disk_op_s *op);
-int cdb_write(struct disk_op_s *op);
-
+int scsi_fill_cmd(struct disk_op_s *op, void *cdbcmd, int maxcdb);
+int scsi_is_read(struct disk_op_s *op);
 int scsi_is_ready(struct disk_op_s *op);
 struct drive_s;
 int scsi_drive_setup(struct drive_s *drive, const char *s, int prio);
+typedef int (*scsi_add_lun)(u32 lun, struct drive_s *tmpl_drv);
+int scsi_rep_luns_scan(struct drive_s *tmp_drive, scsi_add_lun add_lun);
+int scsi_sequential_scan(struct drive_s *tmp_drive, u32 maxluns,
+                         scsi_add_lun add_lun);
 
 #endif // blockcmd.h
