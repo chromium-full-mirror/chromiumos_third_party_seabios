@@ -4,20 +4,22 @@
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 
-#include "bregs.h"
+#include "bregs.h" // struct bregs
 #include "config.h" // CONFIG_*
+#include "e820map.h" // e820_add
 #include "farptr.h" // MAKE_FLATPTR
-#include "hw/pci.h"
-#include "hw/pic.h"
-#include "malloc.h" // csm_malloc_preinit
-#include "memmap.h"
+#include "hw/pci.h" // pci_to_bdf
+#include "hw/pcidevice.h" // pci_probe_devices
+#include "hw/pic.h" // pic_irqmask_read
+#include "malloc.h" // malloc_csm_preinit
+#include "memmap.h" // SYMBOL
 #include "output.h" // dprintf
+#include "paravirt.h" // qemu_preinit
 #include "stacks.h" // wait_threads
 #include "std/acpi.h" // RSDP_SIGNATURE
 #include "std/bda.h" // struct bios_data_area_s
 #include "std/optionrom.h" // struct rom_header
 #include "util.h" // copy_smbios
-#include "paravirt.h" // qemu_preinit
 
 #define UINT8 u8
 #define UINT16 u16
@@ -47,12 +49,11 @@ static void
 csm_return(struct bregs *regs)
 {
     u32 rommax = rom_get_max();
-    extern u8 final_readonly_start[];
 
     dprintf(3, "handle_csm returning AX=%04x\n", regs->ax);
 
     csm_compat_table.UmaAddress = rommax;
-    csm_compat_table.UmaSize = (u32)final_readonly_start - rommax;
+    csm_compat_table.UmaSize = SYMBOL(final_readonly_start) - rommax;
 
     PICMask = pic_irqmask_read();
     __csm_return(regs);
@@ -95,7 +96,7 @@ handle_csm_0000(struct bregs *regs)
     dprintf(3, "LoPmmMemory     %08x\n", csm_init_table->LowPmmMemory);
     dprintf(3, "LoPmmMemorySize %08x\n", csm_init_table->LowPmmMemorySizeInBytes);
 
-    csm_malloc_preinit(csm_init_table->LowPmmMemory,
+    malloc_csm_preinit(csm_init_table->LowPmmMemory,
                        csm_init_table->LowPmmMemorySizeInBytes,
                        csm_init_table->HiPmmMemory,
                        csm_init_table->HiPmmMemorySizeInBytes);
@@ -147,11 +148,11 @@ handle_csm_0002(struct bregs *regs)
     struct e820entry *p = (void *)csm_compat_table.E820Pointer;
     int i;
     for (i=0; i < csm_compat_table.E820Length / sizeof(struct e820entry); i++)
-        add_e820(p[i].start, p[i].size, p[i].type);
+        e820_add(p[i].start, p[i].size, p[i].type);
 
     if (csm_init_table->HiPmmMemorySizeInBytes > BUILD_MAX_HIGHTABLE) {
         u32 hi_pmm_end = csm_init_table->HiPmmMemory + csm_init_table->HiPmmMemorySizeInBytes;
-        add_e820(hi_pmm_end - BUILD_MAX_HIGHTABLE, BUILD_MAX_HIGHTABLE, E820_RESERVED);
+        e820_add(hi_pmm_end - BUILD_MAX_HIGHTABLE, BUILD_MAX_HIGHTABLE, E820_RESERVED);
     }
 
     // For PCIBIOS 1ab10e
@@ -183,6 +184,7 @@ handle_csm_0002(struct bregs *regs)
     struct bios_data_area_s *bda = MAKE_FLATPTR(SEG_BDA, 0);
     bda->hdcount = 0;
 
+    thread_setup();
     mathcp_setup();
     timer_setup();
     clock_setup();
@@ -256,11 +258,21 @@ handle_csm_0006(struct bregs *regs)
     u16 region = regs->bx; // (1 for F000 seg, 2 for E000 seg, 0 for either)
     void *chunk = NULL;
 
+    dprintf(3, "Legacy16GetTableAddress size %x align %x region %d\n",
+        size, align, region);
+
     if (!region)
         region = 3;
 
-    dprintf(3, "Legacy16GetTableAddress size %x align %x region %d\n",
-        size, align, region);
+    // DX = Required address alignment. Bit mapped.
+    // First non-zero bit from the right is the alignment.*/
+    if (align) {
+        align = 1 << __ffs(align);
+        if (align < MALLOC_MIN_ALIGN)
+            align = MALLOC_MIN_ALIGN;
+    } else {
+        align = MALLOC_MIN_ALIGN;
+    }
 
     if (region & 2)
         chunk = _malloc(&ZoneLow, size, align);
@@ -288,6 +300,7 @@ handle_csm(struct bregs *regs)
 
     dprintf(3, "handle_csm regs %p AX=%04x\n", regs, regs->ax);
 
+    code_mutable_preinit();
     pic_irqmask_write(PICMask);
 
     switch(regs->ax) {
@@ -306,6 +319,23 @@ handle_csm(struct bregs *regs)
     csm_return(regs);
 }
 
+static int csm_prio_to_seabios(u16 csm_prio)
+{
+    switch (csm_prio) {
+    case BBS_DO_NOT_BOOT_FROM:
+    case BBS_IGNORE_ENTRY:
+        return -1;
+
+    case BBS_LOWEST_PRIORITY:
+    case BBS_UNPRIORITIZED_ENTRY:
+    default:
+        // SeaBIOS default priorities start at 1, with 0 being used for
+        // an item explicitly selected from interactive_bootmenu().
+        // As in find_prio(), add 1 to the value being returned.
+        return csm_prio + 1;
+    }
+}
+
 int csm_bootprio_ata(struct pci_device *pci, int chanid, int slave)
 {
     if (!csm_boot_table)
@@ -314,7 +344,7 @@ int csm_bootprio_ata(struct pci_device *pci, int chanid, int slave)
     int index = 1 + (chanid * 2) + slave;
     dprintf(3, "CSM bootprio for ATA%d,%d (index %d) is %d\n", chanid, slave,
             index, bbs[index].BootPriority);
-    return bbs[index].BootPriority;
+    return csm_prio_to_seabios(bbs[index].BootPriority);
 }
 
 int csm_bootprio_fdc(struct pci_device *pci, int port, int fdid)
@@ -323,7 +353,7 @@ int csm_bootprio_fdc(struct pci_device *pci, int port, int fdid)
         return -1;
     BBS_TABLE *bbs = (void *)csm_boot_table->BbsTable;
     dprintf(3, "CSM bootprio for FDC is %d\n", bbs[0].BootPriority);
-    return bbs[0].BootPriority;
+    return csm_prio_to_seabios(bbs[0].BootPriority);
 }
 
 int csm_bootprio_pci(struct pci_device *pci)
@@ -337,7 +367,7 @@ int csm_bootprio_pci(struct pci_device *pci)
         if (pci->bdf == pci_to_bdf(bbs[i].Bus, bbs[i].Device, bbs[i].Function)) {
             dprintf(3, "CSM bootprio for PCI(%d,%d,%d) is %d\n", bbs[i].Bus,
                     bbs[i].Device, bbs[i].Function, bbs[i].BootPriority);
-            return bbs[i].BootPriority;
+            return csm_prio_to_seabios(bbs[i].BootPriority);
         }
     }
     return -1;

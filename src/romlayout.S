@@ -11,6 +11,8 @@
 #include "hw/rtc.h" // CMOS_RESET_CODE
 #include "x86.h" // CR0_*
 
+        .code16
+
 
 /****************************************************************
  * 16bit / 32bit call trampolines
@@ -20,18 +22,14 @@
 // %edx = return location (in 32bit mode)
 // Clobbers: ecx, flags, segment registers, cr0, idt/gdt
         DECLFUNC transition32
-        .code16
-transition32_for_smi:
-        movl %eax, %ecx
-        jmp 1f
+        .global transition32_nmi_off
 transition32:
-        movl %eax, %ecx
-
         // Disable irqs (and clear direction flag)
         cli
         cld
 
         // Disable nmi
+        movl %eax, %ecx
         movl $CMOS_RESET_CODE|NMI_DISABLE_BIT, %eax
         outb %al, $PORT_CMOS_INDEX
         inb $PORT_CMOS_DATA, %al
@@ -40,92 +38,82 @@ transition32:
         inb $PORT_A20, %al
         orb $A20_ENABLE_BIT, %al
         outb %al, $PORT_A20
+        movl %ecx, %eax
 
+transition32_nmi_off:
         // Set segment descriptors
-1:      lidtw %cs:pmode_IDT_info
+        lidtw %cs:pmode_IDT_info
         lgdtw %cs:rombios32_gdt_48
 
         // Enable protected mode
-        movl %cr0, %eax
-        orl $CR0_PE, %eax
-        movl %eax, %cr0
+        movl %cr0, %ecx
+        andl $~(CR0_PG|CR0_CD|CR0_NW), %ecx
+        orl $CR0_PE, %ecx
+        movl %ecx, %cr0
 
         // start 32bit protected mode code
-        ljmpl $SEG32_MODE32_CS, $(BUILD_BIOS_ADDR + 2f)
+        ljmpl $SEG32_MODE32_CS, $(BUILD_BIOS_ADDR + 1f)
 
         .code32
         // init data segments
-2:      movl $SEG32_MODE32_DS, %eax
-        movw %ax, %ds
-        movw %ax, %es
-        movw %ax, %ss
-        movw %ax, %fs
-        movw %ax, %gs
+1:      movl $SEG32_MODE32_DS, %ecx
+        movw %cx, %ds
+        movw %cx, %es
+        movw %cx, %ss
+        movw %cx, %fs
+        movw %cx, %gs
 
-        movl %ecx, %eax
         jmpl *%edx
+        .code16
 
 // Place CPU into 16bit mode from 32bit mode.
 // %edx = return location (in 16bit mode)
 // Clobbers: ecx, flags, segment registers, cr0, idt/gdt
         DECLFUNC transition16
         .global transition16big
+        .code32
 transition16:
-        movl %eax, %ecx
-
-        // restore data segment limits to 0xffff
-        movl $SEG32_MODE16_DS, %eax
-        movw %ax, %ds
-        movw %ax, %es
-        movw %ax, %ss
-        movw %ax, %fs
-        movw %ax, %gs
-
-#if CONFIG_DISABLE_A20
-        // disable a20
-        inb $PORT_A20, %al
-        andb $~A20_ENABLE_BIT, %al
-        outb %al, $PORT_A20
-#endif
+        // Reset data segment limits
+        movl $SEG32_MODE16_DS, %ecx
+        movw %cx, %ds
+        movw %cx, %es
+        movw %cx, %ss
+        movw %cx, %fs
+        movw %cx, %gs
 
         // Jump to 16bit mode
         ljmpw $SEG32_MODE16_CS, $1f
 
 transition16big:
-        movl %eax, %ecx
-
-        movl $SEG32_MODE16BIG_DS, %eax
-        movw %ax, %ds
-        movw %ax, %es
-        movw %ax, %ss
-        movw %ax, %fs
-        movw %ax, %gs
+        movl $SEG32_MODE16BIG_DS, %ecx
+        movw %cx, %ds
+        movw %cx, %es
+        movw %cx, %ss
+        movw %cx, %fs
+        movw %cx, %gs
 
         ljmpw $SEG32_MODE16BIG_CS, $1f
 
         .code16
-1:
         // Disable protected mode
-        movl %cr0, %eax
-        andl $~CR0_PE, %eax
-        movl %eax, %cr0
+1:      movl %cr0, %ecx
+        andl $~CR0_PE, %ecx
+        movl %ecx, %cr0
 
         // far jump to flush CPU queue after transition to real mode
         ljmpw $SEG_BIOS, $2f
 
-2:
         // restore IDT to normal real-mode defaults
-        lidtw %cs:rmode_IDT_info
+2:      lidtw %cs:rmode_IDT_info
 
         // Clear segment registers
-        xorw %ax, %ax
-        movw %ax, %fs
-        movw %ax, %gs
-        movw %ax, %es
-        movw %ax, %ds
-        movw %ax, %ss  // Assume stack is in segment 0
+        xorw %cx, %cx
+        movw %cx, %fs
+        movw %cx, %gs
+        movw %cx, %es
+        movw %cx, %ds
+        movw %cx, %ss  // Assume stack is in segment 0
 
-        movl %ecx, %eax
         jmpl *%edx
 
 
@@ -136,7 +124,6 @@ transition16big:
 // Far call a 16bit function from 16bit mode with a specified cpu register state
 // %eax = address of struct bregs, %edx = segment of struct bregs
 // Clobbers: %e[bc]x, %e[ds]i, flags
-        .code16
         DECLFUNC __farcall16
 __farcall16:
         // Save %edx/%eax, %ebp
@@ -184,12 +171,14 @@ __farcall16:
         .endm
 
         IRQ_TRAMPOLINE 02
+        IRQ_TRAMPOLINE 05
         IRQ_TRAMPOLINE 10
         IRQ_TRAMPOLINE 13
         IRQ_TRAMPOLINE 15
         IRQ_TRAMPOLINE 16
         IRQ_TRAMPOLINE 18
         IRQ_TRAMPOLINE 19
+        IRQ_TRAMPOLINE 1b
         IRQ_TRAMPOLINE 1c
         IRQ_TRAMPOLINE 4a
 
@@ -203,7 +192,7 @@ __farcall16:
 entry_smi:
         // Transition to 32bit mode.
         movl $1f + BUILD_BIOS_ADDR, %edx
-        jmp transition32_for_smi
+        jmp transition32_nmi_off
         .code32
 1:      movl $BUILD_SMM_ADDR + 0x8000, %esp
         calll _cfunc32flat_handle_smi - BUILD_BIOS_ADDR
@@ -214,8 +203,10 @@ entry_smi:
         DECLFUNC entry_smp
 entry_smp:
         // Transition to 32bit mode.
+        cli
+        cld
         movl $2f + BUILD_BIOS_ADDR, %edx
-        jmp transition32
+        jmp transition32_nmi_off
         .code32
         // Acquire lock and take ownership of shared stack
 1:      rep ; nop
@@ -257,9 +248,9 @@ entry_pmm:
         movw %cx, %ds
         shll $4, %ecx
         movl $_cfunc32flat_handle_pmm, %eax // Setup: call32(handle_pmm, args, -1)
-        leal BREGS_size-6+12(%esp, %ecx), %edx // %edx points to start of args
+        leal PUSHBREGS_size+12(%esp, %ecx), %edx // %edx points to start of args
         movl $-1, %ecx
-        calll call32
+        calll __call32
         movw %ax, BREGS_eax(%esp)       // Modify %ax:%dx to return %eax
         shrl $16, %eax
         movw %ax, BREGS_edx(%esp)
@@ -284,7 +275,7 @@ entry_pnp_real:
         PUSHBREGS
         movw %ss, %cx           // Move %ss to %ds
         movw %cx, %ds
-        leal BREGS_size-6+12(%esp), %eax  // %eax points to start of u16 args
+        leal PUSHBREGS_size+12(%esp), %eax  // %eax points to start of u16 args
         calll handle_pnp
         movw %ax, BREGS_eax(%esp)   // Modify %eax to return %ax
         POPBREGS
@@ -302,8 +293,8 @@ entry_apm16:
         popfw           // restore flags
         lretw
 
-        .code32
         DECLFUNC entry_apm32
+        .code32
 entry_apm32:
         pushfl
         pushl %gs
@@ -314,9 +305,11 @@ entry_apm32:
         popl %gs
         popfl
         lretl
+        .code16
 
 // PCI-BIOS entry points
         DECLFUNC entry_pcibios32
+        .code32
 entry_pcibios32:
         pushfl
         pushl %gs               // Backup %gs and set %gs=%ds
@@ -326,8 +319,8 @@ entry_pcibios32:
         popl %gs
         popfl
         lretl
-
         .code16
+
         DECLFUNC entry_pcibios16
 entry_pcibios16:
         ENTRY_ARG handle_pcibios
@@ -340,8 +333,8 @@ entry_1589:
         iretw
 
 // BIOS32 support
-        .code32
         DECLFUNC entry_bios32
+        .code32
 entry_bios32:
         pushfl
 #if CONFIG_PCIBIOS
@@ -359,12 +352,16 @@ entry_bios32:
         // Return to caller
 2:      popfl
         lretl
+        .code16
 
 // 32bit elf entry point
         DECLFUNC entry_elf
+        .code32
 entry_elf:
         cli
         cld
+        movl %eax, entry_elf_eax
+        movl %ebx, entry_elf_ebx
         lidtl (BUILD_BIOS_ADDR + pmode_IDT_info)
         lgdtl (BUILD_BIOS_ADDR + rombios32_gdt_48)
         movl $SEG32_MODE32_DS, %eax
@@ -375,7 +372,6 @@ entry_elf:
         movw %ax, %ss
         movl $BUILD_STACK_ADDR, %esp
         ljmpl $SEG32_MODE32_CS, $_cfunc32flat_handle_post
-
         .code16
 
 // UEFI Compatibility Support Module (CSM) entry point
@@ -418,12 +414,59 @@ __csm_return:
         popfw
         lretw
 
+// Serial console "hooked vga" entry point
+        DECLFUNC entry_sercon
+entry_sercon:
+        // Setup for chain loading to real vga handler
+        pushfw
+        pushl %cs:sercon_real_vga_handler
+
+        // Set %ds to varlow segment
+        cli
+        cld
+        pushw %ds
+        pushl %eax
+        movl $_zonelow_seg, %eax
+        movl %eax, %ds
+
+        // Test if the sercon handler can be called
+        movl %esp, %eax         // Test for broken x86emu
+        pushl $1f
+        retl
+1:      cmpl %esp, %eax
+        jne 4f
+        cmpb $0, sercon_enable  // Test that sercon is enabled
+        je 3f
+
+        // call handle_sercon
+        popl %eax
+        popw %ds
+2:      pushl $handle_sercon
+#if CONFIG_ENTRY_EXTRASTACK
+        jmp irqentry_arg_extrastack
+#else
+        jmp irqentry_arg
+#endif
+
+        // sercon disabled - check for legacy text modeset and otherwise exit
+3:      popl %eax
+        popw %ds
+        cmpw $0x0007, %ax
+        jle 2b
+        iretw
+
+        // Running on broken x86emu - restore stack and exit
+4:      movl %eax, %esp
+        popl %eax
+        popw %ds
+        iretw
+
 
 /****************************************************************
  * Interrupt entry points
  ****************************************************************/
 
-        // Main entry point for interrupts handled on extra stack
+        // Main entry point for hardware interrupts handled on extra stack
         DECLFUNC irqentry_extrastack
 irqentry_extrastack:
         cli
@@ -433,11 +476,11 @@ irqentry_extrastack:
         movl $_zonelow_seg, %eax
         movl %eax, %ds
         movl StackPos, %eax
-        subl $BREGS_size+8, %eax
+        subl $PUSHBREGS_size+8, %eax
         SAVEBREGS_POP_DSEAX
         popl %ecx
-        movl %esp, BREGS_size(%eax)
-        movw %ss, BREGS_size+4(%eax)
+        movl %esp, PUSHBREGS_size(%eax)
+        movw %ss, PUSHBREGS_size+4(%eax)
 
         movw %ds, %dx           // Setup %ss/%esp and call function
         movw %dx, %ss
@@ -445,12 +488,12 @@ irqentry_extrastack:
         calll *%ecx
 
         movl %esp, %eax         // Restore registers and return
-        movw BREGS_size+4(%eax), %ss
-        movl BREGS_size(%eax), %esp
+        movw PUSHBREGS_size+4(%eax), %ss
+        movl PUSHBREGS_size(%eax), %esp
         RESTOREBREGS_DSEAX
         iretw
 
-        // Main entry point for interrupts handled on extra stack
+        // Main entry point for software interrupts handled on extra stack
         DECLFUNC irqentry_arg_extrastack
 irqentry_arg_extrastack:
         cli
@@ -460,11 +503,11 @@ irqentry_arg_extrastack:
         movl $_zonelow_seg, %eax
         movl %eax, %ds
         movl StackPos, %eax
-        subl $BREGS_size+8, %eax
+        subl $PUSHBREGS_size+16, %eax
         SAVEBREGS_POP_DSEAX     // Save registers on extra stack
         popl %ecx
-        movl %esp, BREGS_size+0(%eax)
-        movw %ss, BREGS_size+4(%eax)
+        movl %esp, PUSHBREGS_size+8(%eax)
+        movw %ss, PUSHBREGS_size+12(%eax)
         popl BREGS_code(%eax)
         popw BREGS_flags(%eax)
 
@@ -474,8 +517,8 @@ irqentry_arg_extrastack:
         calll *%ecx
 
         movl %esp, %eax         // Restore registers and return
-        movw BREGS_size+4(%eax), %ss
-        movl BREGS_size+0(%eax), %esp
+        movw PUSHBREGS_size+12(%eax), %ss
+        movl PUSHBREGS_size+8(%eax), %esp
         popl %edx
         popw %dx
         pushw BREGS_flags(%eax)
@@ -483,13 +526,13 @@ irqentry_arg_extrastack:
         RESTOREBREGS_DSEAX
         iretw
 
-        // Main entry point for interrupts with args
-        DECLFUNC irqentryarg
-irqentryarg:
+        // Main entry point for software interrupts (using caller's stack)
+        DECLFUNC irqentry_arg
+irqentry_arg:
         ENTRY_ARG_ST
         iretw
 
-        // Define an entry point for hardware interrupts.
+        // Helper macros for hardware interrupt declaration
         .macro IRQ_ENTRY num
         .global entry_\num
         entry_\num :
@@ -502,7 +545,7 @@ irqentryarg:
         IRQ_ENTRY \num
         .endm
 
-        // Define an entry point for an interrupt (can read/modify args).
+        // Helper macros for software interrupt declaration
         .macro IRQ_ENTRY_ARG num
         .global entry_\num
         entry_\num :
@@ -510,7 +553,7 @@ irqentryarg:
 #if CONFIG_ENTRY_EXTRASTACK
         jmp irqentry_arg_extrastack
 #else
-        jmp irqentryarg
+        jmp irqentry_arg
 #endif
         .endm
 
@@ -554,7 +597,10 @@ entry_post:
         ENTRY_INTO32 _cfunc32flat_handle_post   // Normal entry point
 
         ORG 0xe2c3
-        IRQ_ENTRY 02
+        .global entry_02
+entry_02:
+        ENTRY handle_02  // NMI handler does not switch onto extra stack
+        iretw
 
         ORG 0xe3fe
         .global entry_13_official
@@ -598,7 +644,8 @@ entry_10_0x0f:
         iretw
 
         ORG 0xf065
-        IRQ_ENTRY_ARG 10
+entry_10:
+        iretw
 
         // 0xf0a4 - VideoParams in misc.c
 

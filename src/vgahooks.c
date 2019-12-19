@@ -7,7 +7,8 @@
 #include "biosvar.h" // GET_GLOBAL
 #include "bregs.h" // set_code_invalid
 #include "config.h" // CONFIG_*
-#include "hw/pci.h" // pci_find_device
+#include "hw/pci.h" // pci_config_readb
+#include "hw/pcidevice.h" // pci_find_device
 #include "hw/pci_ids.h" // PCI_VENDOR_ID_VIA
 #include "hw/pci_regs.h" // PCI_VENDOR_ID
 #include "output.h" // dprintf
@@ -124,7 +125,7 @@ getAMDRamSpeed(void)
 
 /* int 0x15 - 5f18
 
-   ECX = unknown/dont care
+   ECX = unknown/don't care
    EBX[3..0] Frame Buffer Size 2^N MiB
    EBX[7..4] Memory speed:
        0: SDR  66Mhz

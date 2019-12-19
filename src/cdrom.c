@@ -15,9 +15,7 @@
 #include "std/disk.h" // DISK_RET_SUCCESS
 #include "string.h" // memset
 #include "util.h" // cdrom_prepboot
-
-// Locks for removable devices
-u8 CDRom_locks[BUILD_MAX_EXTDRIVE] VARLOW;
+#include "tcgbios.h" // tpm_*
 
 
 /****************************************************************
@@ -33,7 +31,7 @@ cdemu_read(struct disk_op_s *op)
 {
     struct drive_s *drive_gf = GET_LOW(emulated_drive_gf);
     struct disk_op_s dop;
-    dop.drive_gf = drive_gf;
+    dop.drive_fl = drive_gf;
     dop.command = op->command;
     dop.lba = GET_LOW(CDEmu.ilba) + op->lba / 4;
 
@@ -88,7 +86,7 @@ cdemu_read(struct disk_op_s *op)
 }
 
 int
-process_cdemu_op(struct disk_op_s *op)
+cdemu_process_op(struct disk_op_s *op)
 {
     if (!CONFIG_CDROM_EMU)
         return 0;
@@ -99,13 +97,8 @@ process_cdemu_op(struct disk_op_s *op)
     case CMD_WRITE:
     case CMD_FORMAT:
         return DISK_RET_EWRITEPROTECT;
-    case CMD_VERIFY:
-    case CMD_RESET:
-    case CMD_SEEK:
-    case CMD_ISREADY:
-        return DISK_RET_SUCCESS;
     default:
-        return DISK_RET_EPARAM;
+        return default_process_op(op);
     }
 }
 
@@ -122,7 +115,6 @@ cdrom_prepboot(void)
     struct drive_s *drive = malloc_fseg(sizeof(*drive));
     if (!drive) {
         warn_noalloc();
-        free(drive);
         return;
     }
     cdemu_drive_gf = drive;
@@ -144,8 +136,8 @@ cdrom_boot(struct drive_s *drive)
     struct disk_op_s dop;
     int cdid = getDriveId(EXTTYPE_CD, drive);
     memset(&dop, 0, sizeof(dop));
-    dop.drive_gf = drive;
-    if (!dop.drive_gf || cdid < 0)
+    dop.drive_fl = drive;
+    if (!dop.drive_fl || cdid < 0)
         return 1;
 
     int ret = scsi_is_ready(&dop);
@@ -154,10 +146,11 @@ cdrom_boot(struct drive_s *drive)
 
     // Read the Boot Record Volume Descriptor
     u8 buffer[CDROM_SECTOR_SIZE];
+    dop.command = CMD_READ;
     dop.lba = 0x11;
     dop.count = 1;
     dop.buf_fl = buffer;
-    ret = cdb_read(&dop);
+    ret = process_op(&dop);
     if (ret)
         return 3;
 
@@ -173,7 +166,7 @@ cdrom_boot(struct drive_s *drive)
     // And we read the Boot Catalog
     dop.lba = lba;
     dop.count = 1;
-    ret = cdb_read(&dop);
+    ret = process_op(&dop);
     if (ret)
         return 7;
 
@@ -190,6 +183,9 @@ cdrom_boot(struct drive_s *drive)
     // Initial/Default Entry
     if (buffer[0x20] != 0x88)
         return 11; // Bootable
+
+    /* measure 2048 bytes (one sector) */
+    tpm_add_cdrom_catalog(MAKE_FLATPTR(GET_SEG(SS), buffer), sizeof(buffer));
 
     // Fill in el-torito cdrom emulation fields.
     emulated_drive_gf = drive;
@@ -211,12 +207,21 @@ cdrom_boot(struct drive_s *drive)
     CDEmu.device_spec = drive->cntl_id % 2;
 
     // And we read the image in memory
+    nbsectors = DIV_ROUND_UP(nbsectors, 4);
     dop.lba = lba;
-    dop.count = DIV_ROUND_UP(nbsectors, 4);
     dop.buf_fl = MAKE_FLATPTR(boot_segment, 0);
-    ret = cdb_read(&dop);
-    if (ret)
-        return 12;
+    while (nbsectors) {
+        int count = nbsectors;
+        if (count > 64*1024/CDROM_SECTOR_SIZE)
+            count = 64*1024/CDROM_SECTOR_SIZE;
+        dop.count = count;
+        ret = process_op(&dop);
+        if (ret)
+            return 12;
+        nbsectors -= count;
+        dop.lba += count;
+        dop.buf_fl += count*CDROM_SECTOR_SIZE;
+    }
 
     if (media == 0) {
         // No emulation requested - return success.
@@ -268,4 +273,50 @@ cdrom_boot(struct drive_s *drive)
     dprintf(6, "cdemu media=%d\n", media);
 
     return 0;
+}
+
+// check if media is present and the drive is bootable.
+// in case it is return the volume label.
+char*
+cdrom_media_info(struct drive_s *drive)
+{
+    ASSERT32FLAT();
+
+    struct disk_op_s dop;
+    memset(&dop, 0, sizeof(dop));
+    dop.drive_fl = drive;
+
+    int ret = scsi_is_ready(&dop);
+    if (ret)
+        return NULL;
+
+    // Read the Boot Record Volume Descriptor
+    u8 buffer[CDROM_SECTOR_SIZE];
+    dop.command = CMD_READ;
+    dop.lba = 0x11;
+    dop.count = 1;
+    dop.buf_fl = buffer;
+    ret = process_op(&dop);
+    if (ret)
+        return NULL;
+
+    // Is it bootable?
+    if (buffer[0])
+        return NULL;
+    if (strcmp((char*)&buffer[1], "CD001\001EL TORITO SPECIFICATION") != 0)
+        return NULL;
+
+    // Read the Primary Volume Descriptor
+    dop.command = CMD_READ;
+    dop.lba = 0x10;
+    dop.count = 1;
+    dop.buf_fl = buffer;
+    ret = process_op(&dop);
+    if (ret)
+        return NULL;
+
+    // Read volume id, trim trailing spaces
+    char *volume = znprintf(30, "%s", buffer + 40);
+    nullTrailingSpace(volume);
+    return volume;
 }

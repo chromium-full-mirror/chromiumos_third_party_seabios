@@ -86,25 +86,28 @@ typedef struct {
 
 struct uasdrive_s {
     struct drive_s drive;
+    struct usbdevice_s *usbdev;
     struct usb_pipe *command, *status, *data_in, *data_out;
-    int lun;
+    u32 lun;
 };
 
 int
-uas_cmd_data(struct disk_op_s *op, void *cdbcmd, u16 blocksize)
+uas_process_op(struct disk_op_s *op)
 {
     if (!CONFIG_USB_UAS)
         return DISK_RET_EBADTRACK;
 
     struct uasdrive_s *drive_gf = container_of(
-        op->drive_gf, struct uasdrive_s, drive);
+        op->drive_fl, struct uasdrive_s, drive);
 
     uas_ui ui;
     memset(&ui, 0, sizeof(ui));
     ui.hdr.id = UAS_UI_COMMAND;
     ui.hdr.tag = 0xdead;
     ui.command.lun[1] = GET_GLOBALFLAT(drive_gf->lun);
-    memcpy(ui.command.cdb, cdbcmd, sizeof(ui.command.cdb));
+    int blocksize = scsi_fill_cmd(op, ui.command.cdb, sizeof(ui.command.cdb));
+    if (blocksize < 0)
+        return default_process_op(op);
     int ret = usb_send_bulk(GET_GLOBALFLAT(drive_gf->command),
                             USB_DIR_OUT, MAKE_FLATPTR(GET_SEG(SS), &ui),
                             sizeof(ui.hdr) + sizeof(ui.command));
@@ -166,30 +169,41 @@ fail:
     return DISK_RET_EBADTRACK;
 }
 
-static int
-uas_lun_setup(struct usbdevice_s *usbdev,
-              struct usb_pipe *command, struct usb_pipe *status,
-              struct usb_pipe *data_in, struct usb_pipe *data_out,
-              int lun)
+static void
+uas_init_lun(struct uasdrive_s *drive, struct usbdevice_s *usbdev,
+             struct usb_pipe *command, struct usb_pipe *status,
+             struct usb_pipe *data_in, struct usb_pipe *data_out,
+             u32 lun)
 {
-    // Allocate drive structure.
-    struct uasdrive_s *drive = malloc_fseg(sizeof(*drive));
-    if (!drive) {
-        warn_noalloc();
-        return -1;
-    }
     memset(drive, 0, sizeof(*drive));
     if (usb_32bit_pipe(data_in))
         drive->drive.type = DTYPE_UAS_32;
     else
         drive->drive.type = DTYPE_UAS;
+    drive->usbdev = usbdev;
     drive->command = command;
     drive->status = status;
     drive->data_in = data_in;
     drive->data_out = data_out;
     drive->lun = lun;
+}
 
-    int prio = bootprio_find_usb(usbdev, lun);
+static int
+uas_add_lun(u32 lun, struct drive_s *tmpl_drv)
+{
+    struct uasdrive_s *tmpl_lun =
+        container_of(tmpl_drv, struct uasdrive_s, drive);
+    struct uasdrive_s *drive = malloc_fseg(sizeof(*drive));
+    if (!drive) {
+        warn_noalloc();
+        return -1;
+    }
+    uas_init_lun(drive, tmpl_lun->usbdev,
+                 tmpl_lun->command, tmpl_lun->status,
+                 tmpl_lun->data_in, tmpl_lun->data_out,
+                 lun);
+
+    int prio = bootprio_find_usb(drive->usbdev, drive->lun);
     int ret = scsi_drive_setup(&drive->drive, "USB UAS", prio);
     if (ret) {
         free(drive);
@@ -256,9 +270,10 @@ usb_uas_setup(struct usbdevice_s *usbdev)
     if (!command || !status || !data_in || !data_out)
         goto fail;
 
-    /* TODO: send REPORT LUNS.  For now, only LUN 0 is recognized.  */
-    int ret = uas_lun_setup(usbdev, command, status, data_in, data_out, 0);
-    if (ret < 0) {
+    struct uasdrive_s lun0;
+    uas_init_lun(&lun0, usbdev, command, status, data_in, data_out, 0);
+    int ret = scsi_rep_luns_scan(&lun0.drive, uas_add_lun);
+    if (ret <= 0) {
         dprintf(1, "Unable to configure UAS drive.\n");
         goto fail;
     }

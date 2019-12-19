@@ -9,6 +9,7 @@
 #include "dev-q35.h"
 #include "dev-piix.h"
 #include "hw/pci.h" // pci_config_writel
+#include "hw/pcidevice.h" // pci_find_device
 #include "hw/pci_ids.h" // PCI_VENDOR_ID_INTEL
 #include "hw/pci_regs.h" // PCI_DEVICE_ID
 #include "output.h" // dprintf
@@ -18,8 +19,14 @@
 #include "util.h" // smm_setup
 #include "x86.h" // wbinvd
 
-#define SMM_REV_I32 0x00020000
-#define SMM_REV_I64 0x00020064
+/*
+ * Check SMM state save area format (bits 0-15) and require support
+ * for SMBASE relocation.
+ */
+#define SMM_REV_MASK 0x0002ffff
+
+#define SMM_REV_I32  0x00020000
+#define SMM_REV_I64  0x00020064
 
 struct smm_state {
     union {
@@ -45,7 +52,8 @@ struct smm_state {
 struct smm_layout {
     struct smm_state backup1;
     struct smm_state backup2;
-    u8 stack[0x7c00];
+    u32 backup_a20;
+    u8 stack[0x8000 - sizeof(struct smm_state)*2 - sizeof(u32)];
     u64 codeentry;
     u8 pad_8008[0x7df8];
     struct smm_state cpu;
@@ -58,13 +66,14 @@ handle_smi(u16 cs)
         return;
     u8 cmd = inb(PORT_SMI_CMD);
     struct smm_layout *smm = MAKE_FLATPTR(cs, 0);
+    u32 rev = smm->cpu.i32.smm_rev & SMM_REV_MASK;
     dprintf(DEBUG_HDL_smi, "handle_smi cmd=%x smbase=%p\n", cmd, smm);
 
     if (smm == (void*)BUILD_SMM_INIT_ADDR) {
         // relocate SMBASE to 0xa0000
-        if (smm->cpu.i32.smm_rev == SMM_REV_I32) {
+        if (rev == SMM_REV_I32) {
             smm->cpu.i32.smm_base = BUILD_SMM_ADDR;
-        } else if (smm->cpu.i64.smm_rev == SMM_REV_I64) {
+        } else if (rev == SMM_REV_I64) {
             smm->cpu.i64.smm_base = BUILD_SMM_ADDR;
         } else {
             warn_internalerror();
@@ -85,7 +94,7 @@ handle_smi(u16 cs)
     }
 
     if (CONFIG_CALL32_SMM && cmd == CALL32SMM_CMDID) {
-        if (smm->cpu.i32.smm_rev == SMM_REV_I32) {
+        if (rev == SMM_REV_I32) {
             u32 regs[8];
             memcpy(regs, &smm->cpu.i32.eax, sizeof(regs));
             if (smm->cpu.i32.ecx == CALL32SMM_ENTERID) {
@@ -94,13 +103,17 @@ handle_smi(u16 cs)
                 memcpy(&smm->cpu, &smm->backup1, sizeof(smm->cpu));
                 memcpy(&smm->cpu.i32.eax, regs, sizeof(regs));
                 smm->cpu.i32.eip = regs[3];
+                // Enable a20 and backup its previous state
+                smm->backup_a20 = set_a20(1);
             } else if (smm->cpu.i32.ecx == CALL32SMM_RETURNID) {
                 dprintf(9, "smm cpu ret %x esp=%x\n", regs[3], regs[4]);
                 memcpy(&smm->cpu, &smm->backup2, sizeof(smm->cpu));
                 memcpy(&smm->cpu.i32.eax, regs, sizeof(regs));
+                if (!smm->backup_a20)
+                    set_a20(0);
                 smm->cpu.i32.eip = regs[3];
             }
-        } else if (smm->cpu.i64.smm_rev == SMM_REV_I64) {
+        } else if (rev == SMM_REV_I64) {
             u64 regs[8];
             memcpy(regs, &smm->cpu.i64.rdi, sizeof(regs));
             if ((u32)smm->cpu.i64.rcx == CALL32SMM_ENTERID) {
@@ -108,9 +121,13 @@ handle_smi(u16 cs)
                 memcpy(&smm->cpu, &smm->backup1, sizeof(smm->cpu));
                 memcpy(&smm->cpu.i64.rdi, regs, sizeof(regs));
                 smm->cpu.i64.rip = (u32)regs[4];
+                // Enable a20 and backup its previous state
+                smm->backup_a20 = set_a20(1);
             } else if ((u32)smm->cpu.i64.rcx == CALL32SMM_RETURNID) {
                 memcpy(&smm->cpu, &smm->backup2, sizeof(smm->cpu));
                 memcpy(&smm->cpu.i64.rdi, regs, sizeof(regs));
+                if (!smm->backup_a20)
+                    set_a20(0);
                 smm->cpu.i64.rip = (u32)regs[4];
             }
         }
@@ -177,7 +194,7 @@ static void piix4_apmc_smm_setup(int isabdf, int i440_bdf)
 
     /* enable SMI generation */
     value = inl(acpi_pm_base + PIIX_PMIO_GLBCTL);
-    outl(acpi_pm_base + PIIX_PMIO_GLBCTL, value | PIIX_PMIO_GLBCTL_SMI_EN);
+    outl(value | PIIX_PMIO_GLBCTL_SMI_EN, acpi_pm_base + PIIX_PMIO_GLBCTL);
 
     smm_relocate_and_restore();
 

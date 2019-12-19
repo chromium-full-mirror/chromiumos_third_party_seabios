@@ -5,7 +5,6 @@
 #include "types.h" // u8
 
 #define PORT_PS2_DATA          0x0060
-#define PORT_PS2_CTRLB         0x0061
 #define PORT_PS2_STATUS        0x0064
 
 // Standard commands.
@@ -27,7 +26,7 @@
 #define ATKBD_CMD_GETID         0x02f2
 #define ATKBD_CMD_ENABLE        0x00f4
 #define ATKBD_CMD_RESET_DIS     0x00f5
-#define ATKBD_CMD_RESET_BAT     0x02ff
+#define ATKBD_CMD_RESET_BAT     0x01ff
 
 // Mouse commands
 #define PSMOUSE_CMD_SETSCALE11  0x00e6
@@ -62,6 +61,7 @@
 void i8042_reboot(void);
 int ps2_kbd_command(int command, u8 *param);
 int ps2_mouse_command(int command, u8 *param);
+void ps2_check_event(void);
 void ps2port_setup(void);
 
 #endif // ps2port.h

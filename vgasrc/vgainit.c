@@ -14,13 +14,9 @@
 #include "std/optionrom.h" // struct pci_data
 #include "std/pmm.h" // struct pmmheader
 #include "string.h" // checksum_far
-#include "util.h" // VERSION
-#include "vgabios.h" // video_save_pointer_table
+#include "vgabios.h" // SET_VGA
 #include "vgahw.h" // vgahw_setup
-
-struct video_save_pointer_s video_save_pointer_table VAR16;
-
-struct video_param_s video_param_table[29] VAR16;
+#include "vgautil.h" // swcursor_check_event
 
 // Type of emulator platform - for dprintf with certain compile options.
 int PlatformRunningOn VAR16;
@@ -46,13 +42,9 @@ struct pci_data rom_pci_data VAR16 VISIBLE16 = {
  * PMM call and extra stack setup
  ****************************************************************/
 
-u16 ExtraStackSeg VAR16 VISIBLE16;
-
-static void
-allocate_extra_stack(void)
+u32
+allocate_pmm(u32 size, int highmem, int aligned)
 {
-    if (!CONFIG_VGA_ALLOCATE_EXTRA_STACK)
-        return;
     u32 pmmscan;
     for (pmmscan=0; pmmscan < BUILD_BIOS_SIZE; pmmscan+=16) {
         struct pmmheader *pmm = (void*)pmmscan;
@@ -61,29 +53,49 @@ allocate_extra_stack(void)
         if (checksum_far(SEG_BIOS, pmm, GET_FARVAR(SEG_BIOS, pmm->length)))
             continue;
         struct segoff_s entry = GET_FARVAR(SEG_BIOS, pmm->entry);
-        dprintf(1, "Attempting to allocate VGA stack via pmm call to %04x:%04x\n"
+        dprintf(1, "Attempting to allocate %u bytes %s via pmm call to %04x:%04x\n"
+                , size, highmem ? "highmem" : "lowmem"
                 , entry.seg, entry.offset);
         u16 res1, res2;
+        u16 flags = 8 |
+            ( highmem ? 2 : 1 )|
+            ( aligned ? 4 : 0 );
+        size >>= 4;
         asm volatile(
             "pushl %0\n"
-            "pushw $(8|1)\n"            // Permanent low memory request
+            "pushw %2\n"                // flags
             "pushl $0xffffffff\n"       // Anonymous handle
-            "pushl $" __stringify(CONFIG_VGA_EXTRA_STACK_SIZE/16) "\n"
+            "pushl %1\n"                // size
             "pushw $0x00\n"             // PMM allocation request
             "lcallw *12(%%esp)\n"
             "addl $16, %%esp\n"
             "cli\n"
             "cld\n"
-            : "+r" (entry.segoff), "=a" (res1), "=d" (res2) : : "cc", "memory");
+            : "+r" (entry.segoff), "+r" (size), "+r" (flags),
+              "=a" (res1), "=d" (res2) : : "cc", "memory");
         u32 res = res1 | (res2 << 16);
         if (!res || res == PMM_FUNCTION_NOT_SUPPORTED)
-            return;
-        dprintf(1, "VGA stack allocated at %x\n", res);
-        SET_VGA(ExtraStackSeg, res >> 4);
-        extern void entry_10_extrastack(void);
-        SET_IVT(0x10, SEGOFF(get_global_seg(), (u32)entry_10_extrastack));
-        return;
+            return 0;
+        return res;
     }
+    return 0;
+}
+
+u16 ExtraStackSeg VAR16 VISIBLE16;
+
+static void
+allocate_extra_stack(void)
+{
+    if (!CONFIG_VGA_ALLOCATE_EXTRA_STACK)
+        return;
+    u32 res = allocate_pmm(CONFIG_VGA_EXTRA_STACK_SIZE, 0, 0);
+    if (!res)
+        return;
+    dprintf(1, "VGA stack allocated at %x\n", res);
+    SET_VGA(ExtraStackSeg, res >> 4);
+    extern void entry_10_extrastack(void);
+    SET_IVT(0x10, SEGOFF(get_global_seg(), (u32)entry_10_extrastack));
+    return;
 }
 
 
@@ -96,9 +108,7 @@ struct segoff_s Timer_Hook_Resume VAR16 VISIBLE16;
 void VISIBLE16
 handle_timer_hook(void)
 {
-    if (!vga_emulate_text())
-        return;
-    vgafb_set_swcursor(GET_BDA(timer_counter) % 18 < 9);
+    swcursor_check_event();
 }
 
 static void
@@ -134,8 +144,6 @@ init_bios_area(void)
     SET_BDA(modeset_ctl, 0x51);
 
     SET_BDA(dcc_index, CONFIG_VGA_STDVGA_PORTS ? 0x08 : 0xff);
-    SET_BDA(video_savetable
-            , SEGOFF(get_global_seg(), (u32)&video_save_pointer_table));
 
     // FIXME
     SET_BDA(video_msr, 0x00); // Unavailable on vanilla vga, but...
@@ -150,6 +158,7 @@ vga_post(struct bregs *regs)
 {
     serial_debug_preinit();
     dprintf(1, "Start SeaVGABIOS (version %s)\n", VERSION);
+    dprintf(1, "VGABUILD: %s\n", BUILDINFO);
     debug_enter(regs, DEBUG_VGA_POST);
 
     if (CONFIG_VGA_PCI && !GET_GLOBAL(HaveRunInit)) {
@@ -172,8 +181,6 @@ vga_post(struct bregs *regs)
 
     init_bios_area();
 
-    SET_VGA(video_save_pointer_table.videoparam
-            , SEGOFF(get_global_seg(), (u32)video_param_table));
     if (CONFIG_VGA_STDVGA_PORTS)
         stdvga_build_video_param();
 

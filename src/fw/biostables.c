@@ -6,14 +6,15 @@
 
 #include "byteorder.h" // le32_to_cpu
 #include "config.h" // CONFIG_*
-#include "malloc.h" // malloc_fseg
-#include "output.h" // dprintf
 #include "hw/pci.h" // pci_config_writeb
+#include "malloc.h" // malloc_fseg
+#include "memmap.h" // SYMBOL
+#include "output.h" // dprintf
+#include "romfile.h" // romfile_find
 #include "std/acpi.h" // struct rsdp_descriptor
 #include "std/mptable.h" // MPTABLE_SIGNATURE
 #include "std/pirtable.h" // struct pir_header
 #include "std/smbios.h" // struct smbios_entry_point
-#include "romfile.h"
 #include "string.h" // memcpy
 #include "util.h" // copy_table
 #include "x86.h" // outb
@@ -54,6 +55,11 @@ copy_mptable(void *pos)
         return;
     u32 length = p->length * 16;
     u16 mpclength = ((struct mptable_config_s *)p->physaddr)->length;
+    if (length + mpclength > BUILD_MAX_MPTABLE_FSEG) {
+        dprintf(1, "Skipping MPTABLE copy due to large size (%d bytes)\n"
+                , length + mpclength);
+        return;
+    }
     // Allocate final memory location.  (In theory the config
     // structure can go in high memory, but Linux kernels before
     // v2.6.30 crash with that.)
@@ -117,9 +123,8 @@ copy_acpi_rsdp(void *pos)
 
 void *find_acpi_rsdp(void)
 {
-    extern u8 zonefseg_start[], zonefseg_end[];
-    unsigned long start = (unsigned long)zonefseg_start;
-    unsigned long end = (unsigned long)zonefseg_end;
+    unsigned long start = SYMBOL(zonefseg_start);
+    unsigned long end = SYMBOL(zonefseg_end);
     unsigned long pos;
 
     for (pos = ALIGN(start, 0x10); pos <= ALIGN_DOWN(end, 0x10); pos += 0x10)
@@ -129,8 +134,8 @@ void *find_acpi_rsdp(void)
     return NULL;
 }
 
-static struct fadt_descriptor_rev1 *
-find_fadt(void)
+void *
+find_acpi_table(u32 signature)
 {
     dprintf(4, "rsdp=%p\n", RsdpAddr);
     if (!RsdpAddr || RsdpAddr->signature != RSDP_SIGNATURE)
@@ -142,20 +147,20 @@ find_fadt(void)
     void *end = (void*)rsdt + rsdt->length;
     int i;
     for (i=0; (void*)&rsdt->table_offset_entry[i] < end; i++) {
-        struct fadt_descriptor_rev1 *fadt = (void*)rsdt->table_offset_entry[i];
-        if (!fadt || fadt->signature != FACP_SIGNATURE)
+        struct acpi_table_header *tbl = (void*)rsdt->table_offset_entry[i];
+        if (!tbl || tbl->signature != signature)
             continue;
-        dprintf(4, "fadt=%p\n", fadt);
-        return fadt;
+        dprintf(4, "table(%x)=%p\n", signature, tbl);
+        return tbl;
     }
-    dprintf(4, "no fadt found\n");
+    dprintf(4, "no table %x found\n", signature);
     return NULL;
 }
 
 u32
 find_resume_vector(void)
 {
-    struct fadt_descriptor_rev1 *fadt = find_fadt();
+    struct fadt_descriptor_rev1 *fadt = find_acpi_table(FACP_SIGNATURE);
     if (!fadt)
         return 0;
     struct facs_descriptor_rev1 *facs = (void*)fadt->firmware_ctrl;
@@ -213,7 +218,7 @@ acpi_set_reset_reg(struct acpi_20_generic_address *reg, u8 val)
 void
 find_acpi_features(void)
 {
-    struct fadt_descriptor_rev1 *fadt = find_fadt();
+    struct fadt_descriptor_rev1 *fadt = find_acpi_table(FACP_SIGNATURE);
     if (!fadt)
         return;
     u32 pm_tmr = le32_to_cpu(fadt->pm_tmr_blk);
@@ -271,7 +276,7 @@ copy_smbios(void *pos)
     if (SMBiosAddr)
         return;
     struct smbios_entry_point *p = pos;
-    if (memcmp(p->anchor_string, "_SM_", 4))
+    if (p->signature != SMBIOS_SIGNATURE)
         return;
     if (checksum(pos, 0x10) != 0)
         return;
@@ -301,17 +306,42 @@ display_uuid(void)
             if (memcmp(uuid, empty_uuid, sizeof(empty_uuid)) == 0)
                 return;
 
-            printf("Machine UUID"
-                   " %02x%02x%02x%02x"
-                   "-%02x%02x"
-                   "-%02x%02x"
-                   "-%02x%02x"
-                   "-%02x%02x%02x%02x%02x%02x\n"
-                   , uuid[ 0], uuid[ 1], uuid[ 2], uuid[ 3]
-                   , uuid[ 4], uuid[ 5]
-                   , uuid[ 6], uuid[ 7]
-                   , uuid[ 8], uuid[ 9]
-                   , uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+            /*
+             * According to SMBIOS v2.6 the first three fields are encoded in
+             * little-endian format.  Versions prior to v2.6 did not specify
+             * the encoding, but we follow dmidecode and assume big-endian
+             * encoding.
+             */
+            if (SMBiosAddr->smbios_major_version > 2 ||
+                (SMBiosAddr->smbios_major_version == 2 &&
+                 SMBiosAddr->smbios_minor_version >= 6)) {
+                printf("Machine UUID"
+                       " %02x%02x%02x%02x"
+                       "-%02x%02x"
+                       "-%02x%02x"
+                       "-%02x%02x"
+                       "-%02x%02x%02x%02x%02x%02x\n"
+                       , uuid[ 3], uuid[ 2], uuid[ 1], uuid[ 0]
+                       , uuid[ 5], uuid[ 4]
+                       , uuid[ 7], uuid[ 6]
+                       , uuid[ 8], uuid[ 9]
+                       , uuid[10], uuid[11], uuid[12]
+                       , uuid[13], uuid[14], uuid[15]);
+            } else {
+                printf("Machine UUID"
+                       " %02x%02x%02x%02x"
+                       "-%02x%02x"
+                       "-%02x%02x"
+                       "-%02x%02x"
+                       "-%02x%02x%02x%02x%02x%02x\n"
+                       , uuid[ 0], uuid[ 1], uuid[ 2], uuid[ 3]
+                       , uuid[ 4], uuid[ 5]
+                       , uuid[ 6], uuid[ 7]
+                       , uuid[ 8], uuid[ 9]
+                       , uuid[10], uuid[11], uuid[12]
+                       , uuid[13], uuid[14], uuid[15]);
+            }
+
             return;
         }
 }
@@ -447,7 +477,7 @@ void
 smbios_setup(void)
 {
     if (smbios_romfile_setup())
-      return;
+        return;
     smbios_legacy_setup();
 }
 

@@ -9,11 +9,19 @@
  ****************************************************************/
 
 struct disk_op_s {
-    u64 lba;
     void *buf_fl;
-    struct drive_s *drive_gf;
-    u16 count;
+    struct drive_s *drive_fl;
     u8 command;
+    u16 count;
+    union {
+        // Commands: READ, WRITE, VERIFY, SEEK, FORMAT
+        u64 lba;
+        // Commands: SCSI
+        struct {
+            u16 blocksize;
+            void *cdbcmd;
+        };
+    };
 };
 
 #define CMD_RESET   0x00
@@ -23,6 +31,7 @@ struct disk_op_s {
 #define CMD_FORMAT  0x05
 #define CMD_SEEK    0x07
 #define CMD_ISREADY 0x10
+#define CMD_SCSI    0x20
 
 
 /****************************************************************
@@ -71,7 +80,9 @@ struct drive_s {
 #define DTYPE_ESP_SCSI     0x81
 #define DTYPE_MEGASAS      0x82
 #define DTYPE_PVSCSI       0x83
-#define DTYPE_SD           0x90
+#define DTYPE_MPT_SCSI     0x84
+#define DTYPE_SDCARD       0x90
+#define DTYPE_NVME         0x91
 
 #define MAXDESCSIZE 80
 
@@ -79,6 +90,7 @@ struct drive_s {
 #define TRANSLATION_LBA   1
 #define TRANSLATION_LARGE 2
 #define TRANSLATION_RECHS 3
+#define TRANSLATION_HOST 4
 
 #define EXTTYPE_FLOPPY 0
 #define EXTTYPE_HD 1
@@ -100,11 +112,11 @@ int getDriveId(u8 exttype, struct drive_s *drive);
 void map_floppy_drive(struct drive_s *drive);
 void map_hd_drive(struct drive_s *drive);
 void map_cd_drive(struct drive_s *drive);
-void map_sd_drive(struct drive_s *drive);
 struct int13dpt_s;
-int fill_edd(u16 seg, struct int13dpt_s *param_far, struct drive_s *drive_gf);
+int fill_edd(struct segoff_s edd, struct drive_s *drive_fl);
+void block_setup(void);
+int default_process_op(struct disk_op_s *op);
 int process_op(struct disk_op_s *op);
-int send_disk_op(struct disk_op_s *op);
 int create_bounce_buf(void);
 
 #endif // block.h

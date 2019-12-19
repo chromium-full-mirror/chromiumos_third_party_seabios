@@ -26,12 +26,10 @@ detect_serial(u16 port, u8 timeout, u8 count)
         return 0;
     outb(0x02, port+SEROFF_IER);
     u8 ier = inb(port+SEROFF_IER);
-    dprintf(8, "IER is 0x%02x (Expected 0x02 or 0x00)\n", ier);
-    if (ier != 0x02 && ier != 0)
+    if (ier != 0x02)
         return 0;
     u8 iir = inb(port+SEROFF_IIR);
-    dprintf(8, "IIR is 0x%02x (Expected != 0x3f)\n", iir & 0x3f);
-    if ((iir & 0x3f) == 0x3f)
+    if ((iir & 0x3f) != 0x02)
         return 0;
 
     outb(0x00, port+SEROFF_IER);

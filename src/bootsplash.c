@@ -81,7 +81,8 @@ find_videomode(struct vbe_info *vesa_info, struct vbe_mode_info *mode_info
             continue;
         u8 depth = mode_info->bits_per_pixel;
         if (bpp_req == 0) {
-            if (depth != 16 && depth != 24 && depth != 32)
+            if ((depth != 16 && depth != 24 && depth != 32)
+                || mode_info->green_size == 5)
                 continue;
         } else {
             if (depth != bpp_req)
@@ -171,10 +172,10 @@ enable_bootsplash(void)
             dprintf(1, "bmp_decode failed with return code %d...\n", ret);
             goto done;
         }
-        bmp_get_size(bmp, &width, &height);
-        bpp_require = 24;
+        bmp_get_info(bmp, &width, &height, &bpp_require);
     }
-    /* jpeg would use 16 or 24 bpp video mode, BMP use 24bpp mode only */
+
+    // jpeg would use 16 or 24 bpp video mode, BMP uses 16/24/32 bpp mode.
 
     // Try to find a graphics mode with the corresponding dimensions.
     int videomode = find_videomode(vesa_info, mode_info, width, height,
