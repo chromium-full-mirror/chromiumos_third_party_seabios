@@ -243,10 +243,19 @@ void coreboot_debug_putc(char c)
 static void
 scan_tables(u32 start, u32 size)
 {
+    if (size > 0x100000) {
+        dprintf(5, "Size is too large: %d\n", size);
+        size = 0x100000;
+    }
     void *p = (void*)ALIGN(start, 16);
     void *end = (void*)start + size;
-    for (; p<end; p += 16)
+    dprintf(5, "Scanning: %p : %p\n", p, end);
+    for (; p<end; p += 16) {
         copy_table(p);
+        // dprintf(5, ".");
+    }
+
+    dprintf(3, "\nDone Scanning\n");
 }
 
 void
@@ -266,9 +275,12 @@ coreboot_platform_setup(void)
     int i, count = MEM_RANGE_COUNT(cbm);
     for (i=0; i<count; i++) {
         struct cb_memory_range *m = &cbm->map[i];
+
+        dprintf(3, "Looking at type: %x\n", m->type);
         if (m->type == CB_MEM_TABLE)
             scan_tables(m->start, m->size);
     }
+    dprintf(3, "Done relocating coreboot bios tables\n");
 
     find_acpi_features();
 }
