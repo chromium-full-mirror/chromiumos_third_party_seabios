@@ -329,10 +329,17 @@ init_pcirom(struct pci_device *pci, int isvga, u64 *sources)
     dprintf(4, "Attempting to init PCI bdf %pP (vd %04x:%04x)\n"
             , pci, pci->vendor, pci->device);
 
-    char fname[17];
-    snprintf(fname, sizeof(fname), "pci%04x,%04x.rom"
-             , pci->vendor, pci->device);
+    char fname[20];
+    // Try to find rom file with revision included
+    snprintf(fname, sizeof(fname), "pci%04x,%04x,%02x.rom"
+             , pci->vendor, pci->device, pci->revision);
     struct romfile_s *file = romfile_find(fname);
+    if (!file) {
+        // Fallback to finding rom file without revision
+        snprintf(fname, sizeof(fname), "pci%04x,%04x.rom"
+             , pci->vendor, pci->device);
+        file = romfile_find(fname);
+    }
     struct rom_header *rom = NULL;
     if (file)
         rom = deploy_romfile(file);
